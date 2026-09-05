@@ -1418,6 +1418,8 @@ struct BlurPassParams {
     sigma: f32,
     stride: f32,
     source_texel_size: vec2<f32>,
+    padding: vec2<f32>,
+    weights: array<vec4<f32>, 33>,
 };
 
 @group(1) @binding(0) var<uniform> b_blur_pass: BlurPassParams;
@@ -1453,6 +1455,35 @@ fn fs_blur_pass(input: BlurPassVarying) -> @location(0) vec4<f32> {
     // (the copy window fills the whole texture with real content, so edges
     // only clamp where the region itself clamps against the drawable).
     let base = input.uv;
+    // The kernel depends only on sigma, not on the pixel. Normalized weights
+    // are prepared once on the CPU and shared by both separable passes.
+    if (radius <= 128) {
+        if (params.stride == 1.0) {
+            // At unit stride, adjacent taps can share one linear-filtered
+            // texture sample. This is the same weighted sum, including at
+            // clamp-to-edge boundaries. The downsampled first pass keeps its
+            // original tap positions because its samples are farther apart.
+            sum = textureSampleLevel(t_blur_source, s_blur_source, base, 0.0) * b_blur_pass.weights[0].x;
+            for (var k = 1; k <= radius; k += 2) {
+                let first = u32(k);
+                let second = first + 1u;
+                let a = b_blur_pass.weights[first / 4u][first % 4u];
+                let b = b_blur_pass.weights[second / 4u][second % 4u];
+                let weight = a + b;
+                let offset = (f32(k) + b / weight) * step;
+                sum += textureSampleLevel(t_blur_source, s_blur_source, base + offset, 0.0) * weight;
+                sum += textureSampleLevel(t_blur_source, s_blur_source, base - offset, 0.0) * weight;
+            }
+            return sum;
+        }
+        for (var k = -radius; k <= radius; k++) {
+            let ix = u32(abs(k));
+            let weight = b_blur_pass.weights[ix / 4u][ix % 4u];
+            sum += textureSampleLevel(t_blur_source, s_blur_source, base + f32(k) * step, 0.0) * weight;
+        }
+        return sum;
+    }
+    // Preserve arbitrarily large requested radii without a truncated kernel.
     for (var k = -radius; k <= radius; k++) {
         let weight = exp(-f32(k) * f32(k) / (2.0 * sigma * sigma));
         sum += textureSampleLevel(t_blur_source, s_blur_source, base + f32(k) * step, 0.0) * weight;

@@ -122,6 +122,8 @@ struct BlurPassUniform {
     sigma: f32,
     stride: f32,
     source_texel_size: [f32; 2],
+    _padding: [f32; 2],
+    weights: [[f32; 4]; crate::blur_kernel::KERNEL_VECTORS],
 }
 
 /// Uniform for the composite pass (see `BackdropBlurParams` in shaders.wgsl).
@@ -467,6 +469,7 @@ impl WgpuRenderer {
         // pass reads its own region — queue writes can't interleave with a
         // single command buffer's passes.
         let backdrop_slot_stride = (std::mem::size_of::<BackdropBlurUniform>() as u64)
+            .max(std::mem::size_of::<BlurPassUniform>() as u64)
             .max(uniform_alignment)
             .next_multiple_of(uniform_alignment);
         let backdrop_blur_params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -1305,6 +1308,18 @@ impl WgpuRenderer {
         let v_offset = slot_base + self.backdrop_slot_stride;
         let c_offset = slot_base + 2 * self.backdrop_slot_stride;
         let sigma_texels = (sigma / downsample as f32).max(0.5);
+        let weights = crate::blur_kernel::gaussian_weights(sigma_texels);
+        let (horizontal_region, vertical_region) = crate::blur_kernel::blur_regions(
+            [
+                visible.origin.x.0,
+                visible.origin.y.0,
+                visible.size.width.0,
+                visible.size.height.0,
+            ],
+            [copy_x, copy_y, scratch.width, scratch.height],
+            [scratch.blur_width, scratch.blur_height],
+            sigma_texels,
+        );
 
         let resources = self.resources();
         resources.queue.write_buffer(
@@ -1315,6 +1330,8 @@ impl WgpuRenderer {
                 sigma: sigma_texels,
                 stride: downsample as f32,
                 source_texel_size: [1.0 / scratch.width as f32, 1.0 / scratch.height as f32],
+                _padding: [0.0; 2],
+                weights,
             }),
         );
         resources.queue.write_buffer(
@@ -1328,6 +1345,8 @@ impl WgpuRenderer {
                     1.0 / scratch.blur_width as f32,
                     1.0 / scratch.blur_height as f32,
                 ],
+                _padding: [0.0; 2],
+                weights,
             }),
         );
         resources.queue.write_buffer(
@@ -1388,7 +1407,11 @@ impl WgpuRenderer {
             blur_pass.set_pipeline(&resources.pipelines.backdrop_blur_pass);
             blur_pass.set_bind_group(0, &resources.globals_bind_group, &[]);
             blur_pass.set_bind_group(1, &h_group, &[]);
-            blur_pass.draw(0..4, 0..1);
+            let [x, y, width, height] = horizontal_region;
+            if width > 0 && height > 0 {
+                blur_pass.set_scissor_rect(x, y, width, height);
+                blur_pass.draw(0..4, 0..1);
+            }
         }
         {
             let mut blur_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -1408,7 +1431,11 @@ impl WgpuRenderer {
             blur_pass.set_pipeline(&resources.pipelines.backdrop_blur_pass);
             blur_pass.set_bind_group(0, &resources.globals_bind_group, &[]);
             blur_pass.set_bind_group(1, &v_group, &[]);
-            blur_pass.draw(0..4, 0..1);
+            let [x, y, width, height] = vertical_region;
+            if width > 0 && height > 0 {
+                blur_pass.set_scissor_rect(x, y, width, height);
+                blur_pass.draw(0..4, 0..1);
+            }
         }
         true
     }
