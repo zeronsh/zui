@@ -73,6 +73,8 @@ struct StateInner {
     measuring_behavior: ListMeasuringBehavior,
     pending_scroll: Option<PendingScroll>,
     follow_state: FollowState,
+    tail_reservation: Option<(usize, Pixels)>,
+    tail_extra: Pixels,
 }
 
 /// Deferred scroll adjustment applied after the scroll-top item has been remeasured.
@@ -325,9 +327,77 @@ impl ListState {
             measuring_behavior: ListMeasuringBehavior::default(),
             pending_scroll: None,
             follow_state: FollowState::default(),
+            tail_reservation: None,
+            tail_extra: Pixels::ZERO,
         })));
         this.splice(0..0, item_count);
         this
+    }
+
+    /// Reserve one viewport, less `inset`, from `start` through the final item.
+    /// The unused portion is trailing space in the final item's list box.
+    /// It is recalculated from natural row heights during layout, before
+    /// scroll clamping and painting; appending rows consumes the same space.
+    /// Unlike padding updated after paint, it cannot create a temporary
+    /// scrollable gap. This does not force off-screen rows to be rendered.
+    pub fn set_tail_reservation(&self, reservation: Option<(usize, Pixels)>) {
+        if self.0.borrow().tail_reservation == reservation {
+            return;
+        }
+        self.clear_tail_extra();
+        self.0.borrow_mut().tail_reservation = reservation;
+    }
+
+    fn clear_tail_extra(&self) {
+        let state = &mut *self.0.borrow_mut();
+        if state.tail_extra == Pixels::ZERO || state.items.is_empty() {
+            return;
+        }
+        let last = state.items.summary().count - 1;
+        let mut cursor = state.items.cursor::<Count>(());
+        let mut items = cursor.slice(&Count(last), Bias::Right);
+        if let Some(item) = cursor.item() {
+            let size_hint = item.size_hint().map(|mut size| {
+                size.height = (size.height - state.tail_extra).max(Pixels::ZERO);
+                size
+            });
+            items.push(
+                ListItem::Unmeasured {
+                    size_hint,
+                    focus_handle: item.focus_handle(),
+                },
+                (),
+            );
+        }
+        drop(cursor);
+        state.items = items;
+        state.tail_extra = Pixels::ZERO;
+    }
+
+    /// Pixel coordinate in the measured height tree, including retained
+    /// hints. Does not mutate the viewport or its pending scroll adjustment.
+    pub fn offset_for_item(&self, ix: usize) -> Pixels {
+        let state = self.0.borrow();
+        let mut cursor = state.items.cursor::<ListItemSummary>(());
+        cursor
+            .summary::<_, ListItemSummary>(&Count(ix), Bias::Right)
+            .height
+    }
+
+    /// Whether measured natural content has consumed the tail reservation.
+    /// Unknown row heights contribute zero; retained hints remain estimates.
+    pub fn tail_reservation_filled(&self) -> bool {
+        let state = self.0.borrow();
+        let Some((start, inset)) = state.tail_reservation else {
+            return false;
+        };
+        let minimum =
+            (state.last_layout_bounds.unwrap_or_default().size.height - inset).max(Pixels::ZERO);
+        let mut cursor = state.items.cursor::<ListItemSummary>(());
+        let prefix = cursor
+            .summary::<_, ListItemSummary>(&Count(start), Bias::Right)
+            .height;
+        state.items.summary().height - state.tail_extra - prefix >= minimum
     }
 
     /// Set the list to measure all items in the list in the first layout phase.
@@ -513,6 +583,7 @@ impl ListState {
         old_range: Range<usize>,
         focus_handles: impl IntoIterator<Item = Option<FocusHandle>>,
     ) {
+        self.clear_tail_extra();
         let state = &mut *self.0.borrow_mut();
 
         let mut old_items = state.items.cursor::<Count>(());
@@ -1015,6 +1086,56 @@ impl StateInner {
         self.items = SumTree::from_iter(measured_items, ());
     }
 
+    fn reserve_tail(
+        &mut self,
+        old_items: &SumTree<ListItem>,
+        measured_start: usize,
+        measured: &mut VecDeque<ListItem>,
+        layouts: &mut VecDeque<ItemLayout>,
+        applied: &mut Pixels,
+        viewport_height: Pixels,
+    ) -> Pixels {
+        let Some((start, inset)) = self.tail_reservation else {
+            return Pixels::ZERO;
+        };
+        let minimum = (viewport_height - inset).max(Pixels::ZERO);
+        let count = old_items.summary().count;
+        if measured.is_empty() || measured_start + measured.len() != count || start >= count {
+            return Pixels::ZERO;
+        }
+        let mut cursor = old_items.cursor::<ListItemSummary>(());
+        cursor.seek(&Count(start), Bias::Right);
+        let earlier: ListItemSummary =
+            cursor.summary(&Count(measured_start.max(start)), Bias::Right);
+        // If a direct jump skipped unknown rows, let layout walk backward
+        // naturally first. Guessing zero for them would manufacture a gap.
+        if earlier.has_unknown_height {
+            self.tail_extra = Pixels::ZERO;
+            return Pixels::ZERO;
+        }
+        let mut natural = earlier.height;
+        for (ix, item) in measured.iter().enumerate() {
+            if measured_start + ix >= start {
+                natural += item.size().unwrap().height;
+            }
+        }
+        natural -= *applied;
+        let extra = (minimum - natural).max(Pixels::ZERO);
+        let delta = extra - *applied;
+        if let Some(ListItem::Measured { size, .. }) = measured.back_mut() {
+            size.height += delta;
+        }
+        if let Some(layout) = layouts
+            .back_mut()
+            .filter(|layout| layout.index + 1 == count)
+        {
+            layout.size.height += delta;
+        }
+        *applied = extra;
+        self.tail_extra = extra;
+        delta
+    }
+
     fn layout_items(
         &mut self,
         available_width: Option<Pixels>,
@@ -1062,7 +1183,11 @@ impl StateInner {
             let mut size = item.size();
 
             // If we're within the visible area or the height wasn't cached, render and measure the item's element
-            if visible_height < available_height || size.is_none() {
+            if visible_height < available_height
+                || size.is_none()
+                || (self.tail_reservation.is_some()
+                    && scroll_top.item_ix + ix + 1 == old_items.summary().count)
+            {
                 let item_index = scroll_top.item_ix + ix;
                 let mut element = render_item(item_index, window, cx);
                 let element_size = element.layout_as_root(available_item_space, window, cx);
@@ -1113,6 +1238,15 @@ impl StateInner {
                 focus_handle: item.focus_handle(),
             });
         }
+        let mut applied_tail_extra = Pixels::ZERO;
+        rendered_height += self.reserve_tail(
+            &old_items,
+            scroll_top.item_ix,
+            &mut measured_items,
+            &mut item_layouts,
+            &mut applied_tail_extra,
+            available_height,
+        );
         rendered_height += padding.bottom;
 
         // Prepare to start walking upward from the item at the scroll top.
@@ -1145,6 +1279,15 @@ impl StateInner {
                     break;
                 }
             }
+
+            rendered_height += self.reserve_tail(
+                &old_items,
+                cursor.start().0,
+                &mut measured_items,
+                &mut item_layouts,
+                &mut applied_tail_extra,
+                available_height,
+            );
 
             scroll_top = ListOffset {
                 item_ix: cursor.start().0,
