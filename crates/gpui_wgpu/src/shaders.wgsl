@@ -594,6 +594,25 @@ fn vs_quad(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) insta
     return out;
 }
 
+// Plain rectangular fills have no gradient, border, corner or edge fade.
+// Using a separate entry point lets drivers compile a small fragment shader
+// without a per-pixel instance-buffer read or the general quad control flow.
+@fragment
+fn fs_solid_quad(input: QuadVarying) -> @location(0) vec4<f32> {
+    if (any(input.clip_distances < vec4<f32>(0.0))) {
+        return vec4<f32>(0.0);
+    }
+    return blend_color(input.background_solid, 1.0);
+}
+
+// The renderer selects this only for alpha-one fills whose geometry or
+// scissor is entirely inside the content mask. No destination read, clipping
+// calculation or premultiplication is necessary for these pixels.
+@fragment
+fn fs_opaque_solid_quad(input: QuadVarying) -> @location(0) vec4<f32> {
+    return input.background_solid;
+}
+
 @fragment
 fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
     // Alpha clip first, since we don't have `clip_distance`.

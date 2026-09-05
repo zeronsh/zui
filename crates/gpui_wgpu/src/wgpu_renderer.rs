@@ -83,6 +83,8 @@ pub struct WgpuSurfaceConfig {
 
 struct WgpuPipelines {
     quads: wgpu::RenderPipeline,
+    solid_quads: wgpu::RenderPipeline,
+    opaque_solid_quads: wgpu::RenderPipeline,
     shadows: wgpu::RenderPipeline,
     path_rasterization: wgpu::RenderPipeline,
     paths: wgpu::RenderPipeline,
@@ -411,9 +413,7 @@ impl WgpuRenderer {
 
         // COPY_SRC lets the backdrop blur snapshot framebuffer regions;
         // without it (rare compositor restrictions) blurs are skipped.
-        let surface_supports_copy_src = surface_caps
-            .usages
-            .contains(wgpu::TextureUsages::COPY_SRC);
+        let surface_supports_copy_src = surface_caps.usages.contains(wgpu::TextureUsages::COPY_SRC);
         let surface_usage = if surface_supports_copy_src {
             wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC
         } else {
@@ -896,6 +896,33 @@ impl WgpuRenderer {
             &shader_module,
         );
 
+        let solid_quads = create_pipeline(
+            "solid_quads",
+            "vs_quad",
+            "fs_solid_quad",
+            &layouts.globals,
+            &layouts.instances,
+            wgpu::PrimitiveTopology::TriangleStrip,
+            &[Some(color_target.clone())],
+            1,
+            &shader_module,
+        );
+
+        let opaque_solid_quads = create_pipeline(
+            "opaque_solid_quads",
+            "vs_quad",
+            "fs_opaque_solid_quad",
+            &layouts.globals,
+            &layouts.instances,
+            wgpu::PrimitiveTopology::TriangleStrip,
+            &[Some(wgpu::ColorTargetState {
+                blend: None,
+                ..color_target.clone()
+            })],
+            1,
+            &shader_module,
+        );
+
         let shadows = create_pipeline(
             "shadows",
             "vs_shadow",
@@ -1066,6 +1093,8 @@ impl WgpuRenderer {
 
         WgpuPipelines {
             quads,
+            solid_quads,
+            opaque_solid_quads,
             shadows,
             path_rasterization,
             paths,
@@ -1823,8 +1852,12 @@ impl WgpuRenderer {
                             continue;
                         }
                         drop(pass);
-                        let blurred =
-                            self.process_backdrop_blur(&mut encoder, &frame.texture, blur, blur_index);
+                        let blurred = self.process_backdrop_blur(
+                            &mut encoder,
+                            &frame.texture,
+                            blur,
+                            blur_index,
+                        );
                         pass = Self::continue_main_pass(&mut encoder, &frame_view);
                         if blurred {
                             self.draw_backdrop_composite(blur_index, &mut pass);
@@ -1946,14 +1979,122 @@ impl WgpuRenderer {
         instance_offset: &mut u64,
         pass: &mut wgpu::RenderPass<'_>,
     ) -> bool {
-        let data = unsafe { Self::instance_bytes(quads) };
-        self.draw_instances(
-            data,
-            quads.len() as u32,
-            &self.resources().pipelines.quads,
-            instance_offset,
-            pass,
-        )
+        // Additional draw calls trade command overhead for less fragment work.
+        // Keep hardware batches intact; software adapters benefit from splitting
+        // large interiors because their fragment shaders consume CPU directly.
+        if self.adapter_info.device_type != wgpu::DeviceType::Cpu {
+            let pipeline = if quads.iter().all(is_unclipped_opaque_quad) {
+                &self.resources().pipelines.opaque_solid_quads
+            } else if quads.iter().all(is_simple_solid_quad) {
+                &self.resources().pipelines.solid_quads
+            } else {
+                &self.resources().pipelines.quads
+            };
+            return self.draw_instances(
+                unsafe { Self::instance_bytes(quads) },
+                quads.len() as u32,
+                pipeline,
+                instance_offset,
+                pass,
+            );
+        }
+        // Keep contiguous runs in their original paint order. The simple fill
+        // pipeline avoids executing the general border/gradient shader for
+        // every pixel of large, plain backgrounds.
+        let mut start = 0;
+        while start < quads.len() {
+            if let Some(interior) = solid_quad_interior(
+                &quads[start],
+                [self.surface_config.width, self.surface_config.height],
+            ) {
+                if !self.draw_quad_interior(&quads[start], interior, instance_offset, pass) {
+                    return false;
+                }
+                start += 1;
+                continue;
+            }
+            let kind = simple_quad_kind(&quads[start]);
+            let end = start
+                + 1
+                + quads[start + 1..]
+                    .iter()
+                    .take_while(|quad| {
+                        simple_quad_kind(quad) == kind
+                            && solid_quad_interior(
+                                quad,
+                                [self.surface_config.width, self.surface_config.height],
+                            )
+                            .is_none()
+                    })
+                    .count();
+            let pipeline = match kind {
+                SimpleQuadKind::Opaque => &self.resources().pipelines.opaque_solid_quads,
+                SimpleQuadKind::Solid => &self.resources().pipelines.solid_quads,
+                SimpleQuadKind::General => &self.resources().pipelines.quads,
+            };
+            if !self.draw_instances(
+                unsafe { Self::instance_bytes(&quads[start..end]) },
+                (end - start) as u32,
+                pipeline,
+                instance_offset,
+                pass,
+            ) {
+                return false;
+            }
+            start = end;
+        }
+        true
+    }
+
+    fn draw_quad_interior(
+        &self,
+        quad: &Quad,
+        interior: [u32; 4],
+        instance_offset: &mut u64,
+        pass: &mut wgpu::RenderPass<'_>,
+    ) -> bool {
+        let data = unsafe { Self::instance_bytes(std::slice::from_ref(quad)) };
+        let Some((offset, size)) = self.write_to_instance_buffer(instance_offset, data) else {
+            return false;
+        };
+        let resources = self.resources();
+        let group = resources
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("quad_interior"),
+                layout: &resources.bind_group_layouts.instances,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.instance_binding(offset, size),
+                }],
+            });
+        pass.set_bind_group(0, &resources.globals_bind_group, &[]);
+        pass.set_bind_group(1, &group, &[]);
+        pass.set_pipeline(&resources.pipelines.quads);
+        for [x, y, width, height] in exterior_scissors(
+            interior,
+            [self.surface_config.width, self.surface_config.height],
+        ) {
+            if width > 0 && height > 0 {
+                pass.set_scissor_rect(x, y, width, height);
+                pass.draw(0..4, 0..1);
+            }
+        }
+        pass.set_pipeline(
+            if quad
+                .background
+                .as_solid()
+                .is_some_and(|color| color.a == 1.0)
+            {
+                &resources.pipelines.opaque_solid_quads
+            } else {
+                &resources.pipelines.solid_quads
+            },
+        );
+        pass.set_scissor_rect(interior[0], interior[1], interior[2], interior[3]);
+        pass.draw(0..4, 0..1);
+        pass.set_scissor_rect(0, 0, self.surface_config.width, self.surface_config.height);
+        true
     }
 
     fn draw_shadows(
@@ -2530,4 +2671,182 @@ fn batch_first_order(scene: &Scene, batch: &PrimitiveBatch) -> DrawOrder {
         }
         PrimitiveBatch::Surfaces(range) => scene.surfaces[range.start].order,
     }
+}
+
+/// The specialized fragment shader implements exactly this subset of `fs_quad`.
+fn is_simple_solid_quad(quad: &Quad) -> bool {
+    quad.background.as_solid().is_some()
+        && quad.corner_radii == Default::default()
+        && quad.border_widths == Default::default()
+        && quad.fade.band_top <= 0.0
+        && quad.fade.band_bottom <= 0.0
+        && quad.fade.band_left <= 0.0
+        && quad.fade.band_right <= 0.0
+}
+
+#[cfg(all(test, not(target_family = "wasm")))]
+#[path = "solid_quad_tests.rs"]
+mod solid_quad_tests;
+
+// Stay strictly inside the general shader's existing interior fast path. A
+// one-pixel guard excludes fractional border/corner coverage and fade ramps.
+// Small shapes retain batching: five draws only pay off for large interiors.
+fn solid_quad_interior(quad: &Quad, viewport: [u32; 2]) -> Option<[u32; 4]> {
+    if is_simple_solid_quad(quad) || quad.background.as_solid().is_none() {
+        return None;
+    }
+    let bounds = quad.bounds;
+    let mask = quad.content_mask.bounds;
+    let fade = quad.fade;
+    if ![
+        bounds.origin.x.0,
+        bounds.origin.y.0,
+        bounds.size.width.0,
+        bounds.size.height.0,
+        mask.origin.x.0,
+        mask.origin.y.0,
+        mask.size.width.0,
+        mask.size.height.0,
+        fade.top_y,
+        fade.bottom_y,
+        fade.left_x,
+        fade.right_x,
+        fade.band_top,
+        fade.band_bottom,
+        fade.band_left,
+        fade.band_right,
+    ]
+    .iter()
+    .all(|v| v.is_finite())
+    {
+        return None;
+    }
+    // The pixel guard below assumes subpixel f32 precision. Very large
+    // offscreen coordinates keep the original shader instead.
+    if [
+        bounds.origin.x.0,
+        bounds.origin.y.0,
+        bounds.size.width.0,
+        bounds.size.height.0,
+        fade.top_y,
+        fade.bottom_y,
+        fade.left_x,
+        fade.right_x,
+        fade.band_top,
+        fade.band_bottom,
+        fade.band_left,
+        fade.band_right,
+    ]
+    .iter()
+    .any(|v| v.abs() > 1_048_576.0)
+    {
+        return None;
+    }
+    let radii = &quad.corner_radii;
+    let borders = &quad.border_widths;
+    let values = [
+        radii.top_left.0,
+        radii.top_right.0,
+        radii.bottom_left.0,
+        radii.bottom_right.0,
+        borders.top.0,
+        borders.right.0,
+        borders.bottom.0,
+        borders.left.0,
+    ];
+    if !values.iter().all(|v| v.is_finite()) {
+        return None;
+    }
+    let inset = values.into_iter().fold(0.0_f32, f32::max) + 1.0;
+    let mut left = quad.bounds.origin.x.0 + inset;
+    let mut top = quad.bounds.origin.y.0 + inset;
+    let mut right = quad.bounds.origin.x.0 + quad.bounds.size.width.0 - inset;
+    let mut bottom = quad.bounds.origin.y.0 + quad.bounds.size.height.0 - inset;
+    if fade.band_left > 0.0 {
+        left = left.max(fade.left_x + fade.band_left + 1.0);
+    }
+    if fade.band_top > 0.0 {
+        top = top.max(fade.top_y + fade.band_top + 1.0);
+    }
+    if fade.band_right > 0.0 {
+        right = right.min(fade.right_x - fade.band_right - 1.0);
+    }
+    if fade.band_bottom > 0.0 {
+        bottom = bottom.min(fade.bottom_y - fade.band_bottom - 1.0);
+    }
+    left = left.max(mask.origin.x.0);
+    top = top.max(mask.origin.y.0);
+    right = right.min(mask.origin.x.0 + mask.size.width.0);
+    bottom = bottom.min(mask.origin.y.0 + mask.size.height.0);
+    if ![left, top, right, bottom].iter().all(|v| v.is_finite()) {
+        return None;
+    }
+    let x = left.ceil().clamp(0.0, viewport[0] as f32) as u32;
+    let y = top.ceil().clamp(0.0, viewport[1] as f32) as u32;
+    let end_x = right.floor().clamp(0.0, viewport[0] as f32) as u32;
+    let end_y = bottom.floor().clamp(0.0, viewport[1] as f32) as u32;
+    let width = end_x.saturating_sub(x);
+    let height = end_y.saturating_sub(y);
+    (u64::from(width) * u64::from(height) >= 16_384).then_some([x, y, width, height])
+}
+
+// Four disjoint strips partition the viewport outside the interior. Drawing
+// the original geometry in each preserves all of its existing edge shading.
+fn exterior_scissors([x, y, width, height]: [u32; 4], [vw, vh]: [u32; 2]) -> [[u32; 4]; 4] {
+    [
+        [0, 0, x, vh],
+        [x + width, 0, vw - x - width, vh],
+        [x, 0, width, y],
+        [x, y + height, width, vh - y - height],
+    ]
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SimpleQuadKind {
+    General,
+    Solid,
+    Opaque,
+}
+
+fn simple_quad_kind(quad: &Quad) -> SimpleQuadKind {
+    if is_unclipped_opaque_quad(quad) {
+        SimpleQuadKind::Opaque
+    } else if is_simple_solid_quad(quad) {
+        SimpleQuadKind::Solid
+    } else {
+        SimpleQuadKind::General
+    }
+}
+
+// With blending disabled, alpha clipping must never produce a transparent
+// fragment. Only complete, fully opaque rectangles can use this batch path.
+fn is_unclipped_opaque_quad(quad: &Quad) -> bool {
+    if !is_simple_solid_quad(quad)
+        || !quad
+            .background
+            .as_solid()
+            .is_some_and(|color| color.a == 1.0)
+    {
+        return false;
+    }
+    let bounds = quad.bounds;
+    let mask = quad.content_mask.bounds;
+    [
+        bounds.origin.x.0,
+        bounds.origin.y.0,
+        bounds.size.width.0,
+        bounds.size.height.0,
+        mask.origin.x.0,
+        mask.origin.y.0,
+        mask.size.width.0,
+        mask.size.height.0,
+    ]
+    .iter()
+    .all(|v| v.is_finite())
+        && bounds.size.width.0 > 0.0
+        && bounds.size.height.0 > 0.0
+        && bounds.origin.x >= mask.origin.x
+        && bounds.origin.y >= mask.origin.y
+        && bounds.origin.x.0 + bounds.size.width.0 <= mask.origin.x.0 + mask.size.width.0
+        && bounds.origin.y.0 + bounds.size.height.0 <= mask.origin.y.0 + mask.size.height.0
 }
