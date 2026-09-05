@@ -579,7 +579,11 @@ impl ListState {
 
         let start_pixel_offset = cursor.start().height + current_offset.offset_in_item;
         let new_pixel_offset = (start_pixel_offset + distance).max(px(0.));
-        if new_pixel_offset > start_pixel_offset {
+        // scroll_to can anchor an item below the viewport top using a
+        // negative offset_in_item. Even a positive distance may then land
+        // before this cursor's position: compare against the tree position,
+        // not the viewport offset, before using a forward-only seek.
+        if new_pixel_offset >= cursor.start().height {
             cursor.seek_forward(&Height(new_pixel_offset), Bias::Right);
         } else {
             cursor.seek(&Height(new_pixel_offset), Bias::Right);
@@ -1848,6 +1852,35 @@ mod test {
         let offset = state.logical_scroll_top();
         assert_eq!(offset.item_ix, 0);
         assert_eq!(offset.offset_in_item, px(0.));
+    }
+
+    #[gpui::test]
+    fn test_scroll_by_from_negative_item_offset(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+        let state = ListState::new(5, crate::ListAlignment::Top, px(10.)).measure_all();
+        cx.draw(point(px(0.), px(0.)), size(px(100.), px(100.)), |_, cx| {
+            cx.new(|_| TestListView(state.clone())).into_any_element()
+        });
+
+        // A transcript can anchor a prompt below the viewport's top while
+        // its streaming tail grows. Small positive spring steps then still
+        // land BEFORE the anchored item's start in the measured tree.
+        for (distance, item_ix, offset) in [
+            (1., 1, 11.),
+            (9., 1, 19.),
+            (10., 2, 0.),
+            (11., 2, 1.),
+            (-1., 1, 9.),
+        ] {
+            state.scroll_to(gpui::ListOffset {
+                item_ix: 2,
+                offset_in_item: px(-10.),
+            });
+            state.scroll_by(px(distance));
+            let actual = state.logical_scroll_top();
+            assert_eq!(actual.item_ix, item_ix);
+            assert_eq!(actual.offset_in_item, px(offset));
+        }
     }
 
     struct TestListView(ListState);
