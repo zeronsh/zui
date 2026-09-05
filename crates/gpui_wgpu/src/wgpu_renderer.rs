@@ -2845,8 +2845,13 @@ fn is_unclipped_opaque_quad(quad: &Quad) -> bool {
     .all(|v| v.is_finite())
         && bounds.size.width.0 > 0.0
         && bounds.size.height.0 > 0.0
-        && bounds.origin.x >= mask.origin.x
-        && bounds.origin.y >= mask.origin.y
-        && bounds.origin.x.0 + bounds.size.width.0 <= mask.origin.x.0 + mask.size.width.0
-        && bounds.origin.y.0 + bounds.size.height.0 <= mask.origin.y.0 + mask.size.height.0
+        // Round geometry outward: rasterization can snap a fractional edge
+        // across a pixel center. The original alpha clip must still be a no-op
+        // for every covered sample before we can omit it in the opaque shader.
+        && [bounds.origin.x.0, bounds.origin.y.0, bounds.size.width.0, bounds.size.height.0]
+            .iter().all(|v| v.abs() <= 1_048_576.0)
+        && bounds.origin.x.0.floor() >= mask.origin.x.0
+        && bounds.origin.y.0.floor() >= mask.origin.y.0
+        && (bounds.origin.x.0 + bounds.size.width.0).ceil() <= mask.origin.x.0 + mask.size.width.0
+        && (bounds.origin.y.0 + bounds.size.height.0).ceil() <= mask.origin.y.0 + mask.size.height.0
 }

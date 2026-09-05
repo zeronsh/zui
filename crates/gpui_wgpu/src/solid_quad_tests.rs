@@ -101,6 +101,26 @@ fn compare_shader_pixels(include_interiors: bool) {
         assert!(is_simple_solid_quad(&q));
         quads.push(q);
     }
+    for epsilon in [-0.001, -0.0001, 0.0, 0.0001, 0.001] {
+        for padding in [0.0, 1.0] {
+            let mut q = quad();
+            q.bounds = rectangle(
+                10.5 + epsilon,
+                15.5 - epsilon,
+                127.0 + epsilon,
+                133.0 - epsilon,
+            );
+            q.background = hsla(0.3, 0.7, 0.4, 1.0).into();
+            q.content_mask.bounds = rectangle(
+                q.bounds.origin.x.0 - padding,
+                q.bounds.origin.y.0 - padding,
+                q.bounds.size.width.0 + 2.0 * padding,
+                q.bounds.size.height.0 + 2.0 * padding,
+            );
+            assert_eq!(is_unclipped_opaque_quad(&q), padding == 1.0);
+            quads.push(q);
+        }
+    }
     if include_interiors {
         for i in 0..64 {
             let mut q = quad();
@@ -318,14 +338,9 @@ fn compare_shader_pixels(include_interiors: bool) {
                 readback.unmap();
                 pixels
             };
-            let ranges: Vec<_> = if include_interiors {
-                (193..quads.len())
-                    .map(|i| i..i + 1)
-                    .chain(std::iter::once(0..quads.len()))
-                    .collect()
-            } else {
-                vec![0..quads.len()]
-            };
+            let ranges = (0..quads.len())
+                .map(|i| i..i + 1)
+                .chain(std::iter::once(0..quads.len()));
             for range in ranges {
                 let expected = render(false, range.clone());
                 let actual = render(true, range.clone());
