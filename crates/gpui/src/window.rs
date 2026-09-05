@@ -2,8 +2,8 @@
 use crate::Inspector;
 use crate::{
     Action, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App, AppContext, Arena, Asset,
-    AsyncWindowContext, AvailableSpace, Background, BorderStyle, Bounds, BoxShadow, Capslock,
-    Context, Corners, CursorHideMode, CursorStyle, Decorations, DevicePixels,
+    AsyncWindowContext, AvailableSpace, BackdropBlur, Background, BorderStyle, Bounds, BoxShadow,
+    Capslock, Context, Corners, CursorHideMode, CursorStyle, Decorations, DevicePixels,
     DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity,
     EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
     Hsla, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke,
@@ -12,7 +12,7 @@ use crate::{
     PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point, PolychromeSprite,
     Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams, RenderImage,
     RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
-    SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, BackdropBlur, ScaledPixels, Scene, Shadow, SharedString, Size,
+    SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
     StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
     SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextRenderingMode, TextStyle,
     TextStyleRefinement, ThermalState, TransformationMatrix, Underline, UnderlineStyle,
@@ -120,6 +120,7 @@ struct WindowInvalidatorInner {
     pub dirty_views: FxHashSet<EntityId>,
     pub update_count: usize,
     pub frame_dirty: FrameDirtyAccumulator,
+    frame_requester: Option<Rc<dyn Fn()>>,
 }
 
 /// Per-frame invalidation bookkeeping, drained at draw time and emitted to the
@@ -146,6 +147,7 @@ impl WindowInvalidator {
                 dirty_views: FxHashSet::default(),
                 update_count: 0,
                 frame_dirty: FrameDirtyAccumulator::default(),
+                frame_requester: None,
             })),
         }
     }
@@ -157,6 +159,9 @@ impl WindowInvalidator {
         if inner.draw_phase == DrawPhase::None {
             Self::record_frame_dirty(&mut inner);
             inner.dirty = true;
+            if let Some(request) = &inner.frame_requester {
+                request();
+            }
             cx.push_effect(Effect::Notify { emitter: entity });
             true
         } else {
@@ -172,6 +177,9 @@ impl WindowInvalidator {
         let mut inner = self.inner.borrow_mut();
         inner.dirty = dirty;
         if dirty {
+            if let Some(request) = &inner.frame_requester {
+                request();
+            }
             inner.update_count += 1;
             Self::record_frame_dirty(&mut inner);
         }
@@ -179,6 +187,12 @@ impl WindowInvalidator {
 
     pub fn set_phase(&self, phase: DrawPhase) {
         self.inner.borrow_mut().draw_phase = phase
+    }
+
+    fn request_frame(&self) {
+        if let Some(request) = &self.inner.borrow().frame_requester {
+            request();
+        }
     }
 
     pub fn update_count(&self) -> usize {
@@ -1391,6 +1405,7 @@ impl Window {
         let appearance = platform_window.appearance();
         let text_system = Arc::new(WindowTextSystem::new(cx.text_system().clone()));
         let invalidator = WindowInvalidator::new();
+        invalidator.inner.borrow_mut().frame_requester = platform_window.frame_requester();
         let active = Rc::new(Cell::new(platform_window.is_active()));
         let hovered = Rc::new(Cell::new(platform_window.is_hovered()));
         let needs_present = Rc::new(Cell::new(false));
@@ -1589,6 +1604,14 @@ impl Window {
                 handle
                     .update(&mut cx, |_, window, _| {
                         window.complete_frame();
+                        if !window.invalidator.is_dirty()
+                            && !window.needs_present.get()
+                            && window.next_frame_callbacks.borrow().is_empty()
+                            && !(window.active.get()
+                                && window.input_rate_tracker.borrow().is_high_rate())
+                        {
+                            window.platform_window.pause_frame_requests();
+                        }
                     })
                     .log_err();
             }
@@ -2252,6 +2275,7 @@ impl Window {
     /// Schedule the given closure to be run directly after the current frame is rendered.
     pub fn on_next_frame(&self, callback: impl FnOnce(&mut Window, &mut App) + 'static) {
         RefCell::borrow_mut(&self.next_frame_callbacks).push(Box::new(callback));
+        self.invalidator.request_frame();
     }
 
     /// Schedule a frame to be drawn on the next animation frame.
@@ -3561,8 +3585,7 @@ impl Window {
         let band = fade.band.0.max(1.0);
         let mut ramp: f32 = 1.0;
         if fade.top {
-            ramp = ramp
-                .min(((center.y.0 - fade.bounds.top().0) / fade.top_band()).clamp(0.0, 1.0));
+            ramp = ramp.min(((center.y.0 - fade.bounds.top().0) / fade.top_band()).clamp(0.0, 1.0));
         }
         if fade.bottom {
             ramp = ramp
@@ -3601,8 +3624,7 @@ impl Window {
         }
         if fade.bottom {
             ramp = ramp.min(
-                ((fade.bounds.bottom().0 - bounds.bottom().0) / fade.bottom_band())
-                    .clamp(0.0, 1.0),
+                ((fade.bounds.bottom().0 - bounds.bottom().0) / fade.bottom_band()).clamp(0.0, 1.0),
             );
         }
         if fade.left {
@@ -5057,6 +5079,7 @@ impl Window {
 
         if self.invalidator.update_count() > update_count_before {
             self.input_rate_tracker.borrow_mut().record_input();
+            self.invalidator.request_frame();
             #[cfg(feature = "input-latency-histogram")]
             if self.invalidator.not_drawing() {
                 self.input_latency_tracker.record_input(dispatch_time);
@@ -6815,6 +6838,64 @@ mod tests {
         .unwrap();
 
         assert_eq!(child_bounds.get().size, size(px(300.), px(200.)));
+    }
+
+    #[test]
+    fn idle_window_wakes_for_content_animation_and_resize() {
+        let mut cx = TestAppContext::single();
+        let handle = cx.add_window(|_, _| RootView {
+            explicit_size: false,
+            child_bounds: Rc::new(Cell::new(Bounds::default())),
+        });
+        let mut platform = cx
+            .update_window(handle.into(), |_, window, _| {
+                // Avoid wall-clock throttling of inactive windows in this test.
+                window.active.set(true);
+                window.platform_window.as_test().unwrap().clone()
+            })
+            .unwrap();
+        assert!(platform.simulate_display_tick());
+        assert!(
+            !platform.simulate_display_tick(),
+            "clean window should park"
+        );
+
+        handle.update(&mut cx, |_, _, cx| cx.notify()).unwrap();
+        assert!(
+            platform.simulate_display_tick(),
+            "content must wake a parked window"
+        );
+        assert!(!platform.simulate_display_tick());
+
+        fn animate(window: &Window, remaining: u32, ticks: Rc<Cell<u32>>) {
+            window.on_next_frame(move |window, _| {
+                ticks.set(ticks.get() + 1);
+                window.refresh();
+                if remaining > 1 {
+                    animate(window, remaining - 1, ticks);
+                }
+            });
+        }
+        let ticks = Rc::new(Cell::new(0));
+        cx.update_window(handle.into(), |_, window, _| {
+            animate(window, 3, ticks.clone())
+        })
+        .unwrap();
+        for _ in 0..3 {
+            assert!(platform.simulate_display_tick());
+        }
+        assert_eq!(ticks.get(), 3, "every animation callback must run");
+        assert!(
+            !platform.simulate_display_tick(),
+            "completed animation should park"
+        );
+
+        platform.simulate_resize(size(px(720.), px(480.)));
+        assert!(
+            platform.simulate_display_tick(),
+            "resize must wake a parked window"
+        );
+        assert!(!platform.simulate_display_tick());
     }
 
     struct FocusForwarder {

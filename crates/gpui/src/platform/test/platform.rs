@@ -334,8 +334,10 @@ impl Platform for TestPlatform {
         ThermalState::Nominal
     }
 
-    fn run(&self, _on_finish_launching: Box<dyn FnOnce()>) {
-        unimplemented!()
+    fn run(&self, on_finish_launching: Box<dyn FnOnce()>) {
+        // Standalone profiling drives the benchmark dispatcher explicitly,
+        // using Application::run_embedded just like other embedded platforms.
+        on_finish_launching();
     }
 
     fn quit(&self) {}

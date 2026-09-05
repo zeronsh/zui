@@ -498,6 +498,7 @@ struct MacWindowState {
     cursor_style: CursorStyle,
     cursor_visible: Arc<AtomicBool>,
     frame_source: Option<WindowFrameSource>,
+    frame_requested: Arc<AtomicBool>,
     renderer: renderer::Renderer,
     request_frame_callback: Option<Box<dyn FnMut(RequestFrameOptions)>>,
     event_callback: Option<Box<dyn FnMut(PlatformInput) -> gpui::DispatchEventResult>>,
@@ -673,7 +674,7 @@ impl MacWindowState {
         };
         let data = self.native_view.as_ptr() as *mut c_void;
         self.frame_source
-            .get_or_insert_with(|| WindowFrameSource::new(data, step))
+            .get_or_insert_with(|| WindowFrameSource::new(data, step, self.frame_requested.clone()))
             .start(display_id)
             .log_err();
     }
@@ -893,6 +894,7 @@ impl MacWindow {
                 cursor_style: CursorStyle::Arrow,
                 cursor_visible,
                 frame_source: None,
+                frame_requested: Arc::new(AtomicBool::new(true)),
                 renderer: renderer::new_renderer(
                     renderer_context,
                     native_window as *mut _,
@@ -1669,6 +1671,17 @@ impl PlatformWindow for MacWindow {
 
     fn on_request_frame(&self, callback: Box<dyn FnMut(RequestFrameOptions)>) {
         self.0.as_ref().lock().request_frame_callback = Some(callback);
+    }
+
+    fn frame_requester(&self) -> Option<Rc<dyn Fn()>> {
+        let requested = self.0.lock().frame_requested.clone();
+        Some(Rc::new(move || requested.store(true, Ordering::Release)))
+    }
+
+    fn pause_frame_requests(&self) {
+        let mut state = self.0.lock();
+        state.frame_requested.store(false, Ordering::Release);
+        state.renderer.trim_idle_resources();
     }
 
     fn on_input(&self, callback: Box<dyn FnMut(PlatformInput) -> gpui::DispatchEventResult>) {
@@ -3132,7 +3145,8 @@ unsafe fn remove_layer_background(layer: id) {
                 let hit: BOOL = msg_send![description, containsString: blur_test];
                 if hit == YES {
                     let radius: id = msg_send![class!(NSNumber), numberWithDouble: 60.0f64];
-                    let _: () = msg_send![filter, setValue: radius forKey: ns_string("inputRadius")];
+                    let _: () =
+                        msg_send![filter, setValue: radius forKey: ns_string("inputRadius")];
                     let _: () = msg_send![layer, setFilters: filters];
                     break;
                 }

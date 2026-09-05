@@ -159,13 +159,13 @@ pub(crate) struct MetalRenderer {
     backdrop_blur_pipeline_state: metal::RenderPipelineState,
     /// Framebuffer snapshot (blit dst / gaussian src) + the blurred result the
     /// draw samples from. Sized to the padded blur region (not the drawable),
-    /// recreated when the needed region outgrows them, and released along with
-    /// `backdrop_kernel` after [`SCRATCH_RELEASE_AFTER_FRAMES`] blur-free
+    /// retained in a bounded LRU, and released along with
+    /// `backdrop_kernels` after [`SCRATCH_RELEASE_AFTER_FRAMES`] blur-free
     /// frames.
-    backdrop_scratch: Option<metal::Texture>,
-    backdrop_blurred: Option<metal::Texture>,
-    /// Cached `MPSImageGaussianBlur` kernel, keyed by sigma.
-    backdrop_kernel: Option<(f32, *mut objc::runtime::Object)>,
+    backdrop_textures: Vec<BackdropTextures>,
+    /// A composer and a floating menu use different sigmas in the same frame.
+    /// Keep a small LRU so alternating surfaces do not recreate MPS kernels.
+    backdrop_kernels: Vec<(f32, *mut objc::runtime::Object)>,
     /// Consecutive frames rendered without any backdrop blur / any path.
     blur_free_frames: u32,
     path_free_frames: u32,
@@ -188,6 +188,18 @@ pub(crate) struct MetalRenderer {
     /// rendering headlessly without reading pixels back.
     #[cfg(any(test, feature = "test-support"))]
     headless_render_target: Option<metal::Texture>,
+}
+
+struct BackdropTextures {
+    used_this_frame: bool,
+    scratch: metal::Texture,
+    blurred: metal::Texture,
+}
+
+impl BackdropTextures {
+    fn bytes(&self) -> u64 {
+        self.scratch.width() * self.scratch.height() * 8
+    }
 }
 
 impl Drop for MetalRenderer {
@@ -217,7 +229,10 @@ impl MetalRenderer {
         // Support direct-to-display rendering if the window is not transparent
         // https://developer.apple.com/documentation/metal/managing-your-game-window-for-metal-in-macos
         layer.set_opaque(!transparent);
-        layer.set_maximum_drawable_count(3);
+        // Keep one displayed drawable and one for the next frame. A third
+        // full-resolution surface adds graphics memory to every idle window;
+        // next_drawable provides backpressure when the GPU is still using one.
+        layer.set_maximum_drawable_count(2);
         // Allow texture reading for visual tests (captures screenshots without ScreenCaptureKit)
         #[cfg(any(test, feature = "test-support"))]
         layer.set_framebuffer_only(false);
@@ -409,9 +424,8 @@ impl MetalRenderer {
             path_sprites_pipeline_state,
             shadows_pipeline_state,
             backdrop_blur_pipeline_state,
-            backdrop_scratch: None,
-            backdrop_blurred: None,
-            backdrop_kernel: None,
+            backdrop_textures: Vec::new(),
+            backdrop_kernels: Vec::new(),
             blur_free_frames: 0,
             path_free_frames: 0,
             stats_last_log: None,
@@ -486,9 +500,13 @@ impl MetalRenderer {
             self.path_intermediate_msaa_texture = None;
             return;
         }
-        if self.path_intermediate_texture.as_ref().is_some_and(|texture| {
-            texture.width() == size.width.0 as u64 && texture.height() == size.height.0 as u64
-        }) {
+        if self
+            .path_intermediate_texture
+            .as_ref()
+            .is_some_and(|texture| {
+                texture.width() == size.width.0 as u64 && texture.height() == size.height.0 as u64
+            })
+        {
             return;
         }
 
@@ -532,6 +550,13 @@ impl MetalRenderer {
     }
 
     pub fn draw(&mut self, scene: &Scene) {
+        // Display-link callbacks need not coincide with an AppKit event-pool
+        // drain. Bound temporary encoders/drawables to their submitted frame;
+        // Metal retains all resources referenced by in-flight commands.
+        objc::rc::autoreleasepool(|| self.draw_frame(scene));
+    }
+
+    fn draw_frame(&mut self, scene: &Scene) {
         let layer = match &self.layer {
             Some(l) => l.clone(),
             None => {
@@ -925,6 +950,9 @@ impl MetalRenderer {
         // next popover-open / path frame absorb a one-time recreation.
         // (Releasing is safe with frames in flight — command buffers retain
         // the resources they reference.)
+        for pair in &mut self.backdrop_textures {
+            pair.used_this_frame = false;
+        }
         if scene.backdrop_blurs.is_empty() {
             self.blur_free_frames = self.blur_free_frames.saturating_add(1);
             if self.blur_free_frames >= SCRATCH_RELEASE_AFTER_FRAMES {
@@ -1193,12 +1221,13 @@ impl MetalRenderer {
         self.stats_last_log = Some(now);
 
         let texture_bytes = |texture: &Option<metal::Texture>| {
-            texture
-                .as_ref()
-                .map_or(0, |t| t.width() * t.height() * 4)
+            texture.as_ref().map_or(0, |t| t.width() * t.height() * 4)
         };
-        let backdrop_bytes =
-            texture_bytes(&self.backdrop_scratch) + texture_bytes(&self.backdrop_blurred);
+        let backdrop_bytes: u64 = self
+            .backdrop_textures
+            .iter()
+            .map(BackdropTextures::bytes)
+            .sum();
         // The MSAA texture is memoryless on Apple GPUs (tile memory only).
         let path_bytes = texture_bytes(&self.path_intermediate_texture)
             * if self.path_intermediate_msaa_texture.is_some() && !self.is_apple_gpu {
@@ -1324,19 +1353,45 @@ impl MetalRenderer {
         drawable_height: u64,
         format: MTLPixelFormat,
     ) -> (metal::Texture, metal::Texture) {
-        let reusable = self.backdrop_scratch.as_ref().is_some_and(|scratch| {
-            scratch.pixel_format() == format
-                && scratch.width() >= needed_width
-                && scratch.width() <= drawable_width
-                && scratch.height() >= needed_height
-                && scratch.height() <= drawable_height
+        // A wide composer and tall menu otherwise replace the single cached
+        // pair twice EVERY frame. Cache quantized extents, bounded by four
+        // pairs and at most 32 MiB (or one oversized pair). Exact bucket
+        // matching also avoids blurring an old large menu's entire texture
+        // for a small composer after the menu closes.
+        const QUANTUM: u64 = 64;
+        let width = (needed_width.div_ceil(QUANTUM) * QUANTUM).min(drawable_width);
+        let height = (needed_height.div_ceil(QUANTUM) * QUANTUM).min(drawable_height);
+        // Discard obsolete extents after window shrink, including on a hit.
+        self.backdrop_textures.retain(|pair| {
+            pair.scratch.width() <= drawable_width
+                && pair.scratch.height() <= drawable_height
+                && pair.scratch.pixel_format() == format
         });
-        if !reusable {
-            // Quantize up so popovers whose sizes differ slightly share one
-            // allocation instead of churning every open.
-            const QUANTUM: u64 = 256;
-            let width = (needed_width.div_ceil(QUANTUM) * QUANTUM).min(drawable_width);
-            let height = (needed_height.div_ceil(QUANTUM) * QUANTUM).min(drawable_height);
+        if let Some(index) = self.backdrop_textures.iter().position(|pair| {
+            pair.scratch.pixel_format() == format
+                && pair.scratch.width() == width
+                && pair.scratch.height() == height
+        }) {
+            let mut pair = self.backdrop_textures.remove(index);
+            pair.used_this_frame = true;
+            self.backdrop_textures.push(pair);
+        } else {
+            let needed = width * height * 8;
+            let budget = (drawable_width * drawable_height * 16)
+                .min(32 * 1024 * 1024)
+                .max(needed);
+            while !self.backdrop_textures.is_empty()
+                && (self.backdrop_textures.len() >= 4
+                    || self
+                        .backdrop_textures
+                        .iter()
+                        .map(BackdropTextures::bytes)
+                        .sum::<u64>()
+                        + needed
+                        > budget)
+            {
+                self.backdrop_textures.remove(0);
+            }
             let descriptor = metal::TextureDescriptor::new();
             descriptor.set_texture_type(metal::MTLTextureType::D2);
             descriptor.set_pixel_format(format);
@@ -1344,25 +1399,56 @@ impl MetalRenderer {
             descriptor.set_height(height);
             descriptor.set_usage(metal::MTLTextureUsage::ShaderRead);
             descriptor.set_storage_mode(metal::MTLStorageMode::Private);
-            self.backdrop_scratch = Some(self.device.new_texture(&descriptor));
+            let scratch = self.device.new_texture(&descriptor);
             // The gaussian kernel writes via compute — the dst needs ShaderWrite.
             descriptor.set_usage(
                 metal::MTLTextureUsage::ShaderRead | metal::MTLTextureUsage::ShaderWrite,
             );
-            self.backdrop_blurred = Some(self.device.new_texture(&descriptor));
+            let blurred = self.device.new_texture(&descriptor);
+            self.backdrop_textures.push(BackdropTextures {
+                scratch,
+                blurred,
+                used_this_frame: true,
+            });
         }
-        (
-            self.backdrop_scratch.clone().unwrap(),
-            self.backdrop_blurred.clone().unwrap(),
-        )
+        // A smaller drawable can hit an existing extent while lowering the
+        // aggregate budget. Enforce the bound on hits as well as allocations.
+        let budget = (drawable_width * drawable_height * 16)
+            .min(32 * 1024 * 1024)
+            .max(width * height * 8);
+        while self.backdrop_textures.len() > 1
+            && self
+                .backdrop_textures
+                .iter()
+                .map(BackdropTextures::bytes)
+                .sum::<u64>()
+                > budget
+        {
+            self.backdrop_textures.remove(0);
+        }
+        let pair = self.backdrop_textures.last().unwrap();
+        (pair.scratch.clone(), pair.blurred.clone())
     }
 
-    /// Drop the backdrop scratch textures and the cached gaussian kernel;
+    /// A parked window may render no more frames. Release obsolete blur
+    /// extents now, while retaining every surface used by its last frame so
+    /// a timer-driven animation can resume without allocation churn.
+    pub(crate) fn trim_idle_resources(&mut self) {
+        self.backdrop_textures.retain(|pair| pair.used_this_frame);
+        if self.backdrop_textures.is_empty() {
+            self.release_backdrop_resources();
+        }
+        if self.path_free_frames > 0 {
+            self.path_intermediate_texture = None;
+            self.path_intermediate_msaa_texture = None;
+        }
+    }
+
+    /// Drop the backdrop scratch textures and cached gaussian kernels;
     /// they're recreated on demand the next time a frame contains a blur.
     fn release_backdrop_resources(&mut self) {
-        self.backdrop_scratch = None;
-        self.backdrop_blurred = None;
-        if let Some((_, kernel)) = self.backdrop_kernel.take() {
+        self.backdrop_textures.clear();
+        for (_, kernel) in self.backdrop_kernels.drain(..) {
             unsafe {
                 let _: () = msg_send![kernel, release];
             }
@@ -1373,17 +1459,24 @@ impl MetalRenderer {
     /// optimized true gaussian; hand-rolled sparse taps ghosted on text.
     fn ensure_gaussian_kernel(&mut self, sigma: f32) -> *mut objc::runtime::Object {
         use metal::foreign_types::ForeignType as _;
-        if let Some((cached_sigma, kernel)) = self.backdrop_kernel {
-            if (cached_sigma - sigma).abs() < 0.01 {
-                return kernel;
-            }
+        if let Some(index) = self
+            .backdrop_kernels
+            .iter()
+            .position(|(cached, _)| (*cached - sigma).abs() < 0.01)
+        {
+            let entry = self.backdrop_kernels.remove(index);
+            let kernel = entry.1;
+            self.backdrop_kernels.push(entry);
+            return kernel;
+        }
+        if self.backdrop_kernels.len() >= 4 {
+            let (_, kernel) = self.backdrop_kernels.remove(0);
             unsafe {
                 let _: () = msg_send![kernel, release];
             }
         }
         let kernel: *mut objc::runtime::Object = unsafe {
-            let alloc: *mut objc::runtime::Object =
-                msg_send![class!(MPSImageGaussianBlur), alloc];
+            let alloc: *mut objc::runtime::Object = msg_send![class!(MPSImageGaussianBlur), alloc];
             let kernel: *mut objc::runtime::Object = msg_send![
                 alloc,
                 initWithDevice: self.device.as_ptr() as *mut objc::runtime::Object
@@ -1394,7 +1487,7 @@ impl MetalRenderer {
             let _: () = msg_send![kernel, setEdgeMode: 1u64];
             kernel
         };
-        self.backdrop_kernel = Some((sigma, kernel));
+        self.backdrop_kernels.push((sigma, kernel));
         kernel
     }
 
@@ -1441,8 +1534,10 @@ impl MetalRenderer {
             mem::size_of_val(&source_rect) as u64,
             source_rect.as_ptr() as *const _,
         );
-        command_encoder
-            .set_fragment_texture(BackdropBlurInputIndex::SourceTexture as u64, Some(source_texture));
+        command_encoder.set_fragment_texture(
+            BackdropBlurInputIndex::SourceTexture as u64,
+            Some(source_texture),
+        );
 
         let blur_bytes_len = mem::size_of_val(blurs);
         let buffer_contents =
@@ -2318,6 +2413,7 @@ mod backdrop_blur_tests {
             border_color: transparent_black(),
             corner_radii: Corners::default(),
             border_widths: Edges::default(),
+            fade: gpui::EdgeFadeParams::default(),
         });
     }
 
@@ -2451,7 +2547,10 @@ mod backdrop_blur_tests {
         let b = render(&mut scene);
 
         let diff = max_abs_diff(&a, &b, 0, 168, 152, 312);
-        assert!(diff <= 3, "vignette or shift at window edge: max diff {diff}");
+        assert!(
+            diff <= 3,
+            "vignette or shift at window edge: max diff {diff}"
+        );
     }
 
     #[test]
@@ -2476,6 +2575,96 @@ mod backdrop_blur_tests {
         assert!(
             diff1 <= 3 && diff2 <= 3,
             "blur regions shifted: {diff1} / {diff2}"
+        );
+    }
+
+    #[test]
+    fn alternating_blurs_reuse_resources_and_preserve_pixels() {
+        if metal::Device::system_default().is_none() {
+            return;
+        }
+        objc::rc::autoreleasepool(|| {
+            let mut renderer =
+                MetalRenderer::new_headless(Arc::new(Mutex::new(InstanceBufferPool::default())));
+            let dimensions = size(DevicePixels(VIEW_W), DevicePixels(VIEW_H));
+            let mut scene = Scene::default();
+            push_gradient(&mut scene, true);
+            push_blur(&mut scene, bounds(20., 370., 580., 80.), 16.);
+            push_blur(&mut scene, bounds(80., 20., 180., 360.), 44.);
+            // Foreground content, like the menu labels in a real surface.
+            push_quad(&mut scene, bounds(100., 100., 1., 1.), 1.);
+            scene.finish();
+            let first = renderer.render_scene_to_image(&scene, dimensions).unwrap();
+            let textures: Vec<_> = renderer
+                .backdrop_textures
+                .iter()
+                .map(|p| p.scratch.as_ptr())
+                .collect();
+            let kernels = renderer.backdrop_kernels.clone();
+            assert_eq!(textures.len(), 2);
+            assert_eq!(kernels.len(), 2);
+            for _ in 0..4 {
+                let warm = renderer.render_scene_to_image(&scene, dimensions).unwrap();
+                assert_eq!(first, warm, "cache reuse must preserve every pixel");
+                assert_eq!(
+                    textures,
+                    renderer
+                        .backdrop_textures
+                        .iter()
+                        .map(|p| p.scratch.as_ptr())
+                        .collect::<Vec<_>>()
+                );
+                assert_eq!(kernels, renderer.backdrop_kernels);
+            }
+            let mut composer = Scene::default();
+            push_gradient(&mut composer, true);
+            push_blur(&mut composer, bounds(20., 370., 580., 80.), 16.);
+            composer.finish();
+            renderer
+                .render_scene_to_image(&composer, dimensions)
+                .unwrap();
+            renderer.trim_idle_resources();
+            assert_eq!(renderer.backdrop_textures.len(), 1);
+            assert_eq!(renderer.backdrop_textures[0].scratch.as_ptr(), textures[0]);
+
+            // Closing both surfaces releases their GPU resources after the
+            // same grace period as the original single-pair cache.
+            let mut plain = Scene::default();
+            push_gradient(&mut plain, true);
+            plain.finish();
+            for _ in 0..SCRATCH_RELEASE_AFTER_FRAMES {
+                renderer.render_scene_to_image(&plain, dimensions).unwrap();
+            }
+            assert!(renderer.backdrop_textures.is_empty());
+            assert!(renderer.backdrop_kernels.is_empty());
+        });
+    }
+
+    #[test]
+    fn backdrop_cache_is_bounded_across_sizes_and_window_shrink() {
+        if metal::Device::system_default().is_none() {
+            return;
+        }
+        let mut renderer =
+            MetalRenderer::new_headless(Arc::new(Mutex::new(InstanceBufferPool::default())));
+        for side in (256..=3072).step_by(256) {
+            renderer.ensure_backdrop_scratch(side, side, 4096, 4096, MTLPixelFormat::BGRA8Unorm);
+            assert!(renderer.backdrop_textures.len() <= 4);
+            let bytes: u64 = renderer
+                .backdrop_textures
+                .iter()
+                .map(BackdropTextures::bytes)
+                .sum();
+            assert!(bytes <= (32 * 1024 * 1024).max(side * side * 8));
+            renderer.ensure_gaussian_kernel(side as f32 / 64.);
+            assert!(renderer.backdrop_kernels.len() <= 4);
+        }
+        renderer.ensure_backdrop_scratch(120, 100, 640, 480, MTLPixelFormat::BGRA8Unorm);
+        assert!(
+            renderer
+                .backdrop_textures
+                .iter()
+                .all(|p| p.scratch.width() <= 640 && p.scratch.height() <= 480)
         );
     }
 }
