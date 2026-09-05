@@ -11,6 +11,7 @@ use image::RgbaImage;
 use parking_lot::Mutex;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use std::{
+    cell::Cell,
     rc::{Rc, Weak},
     sync::{self, Arc},
 };
@@ -35,6 +36,8 @@ pub(crate) struct TestWindowState {
     moved_callback: Option<Box<dyn FnMut()>>,
     input_handler: Option<PlatformInputHandler>,
     is_fullscreen: bool,
+    frame_requested: Rc<Cell<bool>>,
+    request_frame_callback: Option<Box<dyn FnMut(RequestFrameOptions)>>,
 }
 
 #[derive(Clone)]
@@ -87,7 +90,24 @@ impl TestWindow {
             moved_callback: None,
             input_handler: None,
             is_fullscreen: false,
+            frame_requested: Rc::new(Cell::new(true)),
+            request_frame_callback: None,
         })))
+    }
+
+    /// Deliver one display tick if the window has requested frames.
+    pub fn simulate_display_tick(&self) -> bool {
+        let mut state = self.0.lock();
+        if !state.frame_requested.get() {
+            return false;
+        }
+        let Some(mut callback) = state.request_frame_callback.take() else {
+            return false;
+        };
+        drop(state);
+        callback(RequestFrameOptions::default());
+        self.0.lock().request_frame_callback = Some(callback);
+        true
     }
 
     pub fn simulate_resize(&mut self, size: Size<Pixels>) {
@@ -258,7 +278,18 @@ impl PlatformWindow for TestWindow {
         self.0.lock().is_fullscreen
     }
 
-    fn on_request_frame(&self, _callback: Box<dyn FnMut(RequestFrameOptions)>) {}
+    fn on_request_frame(&self, callback: Box<dyn FnMut(RequestFrameOptions)>) {
+        self.0.lock().request_frame_callback = Some(callback);
+    }
+
+    fn frame_requester(&self) -> Option<Rc<dyn Fn()>> {
+        let requested = self.0.lock().frame_requested.clone();
+        Some(Rc::new(move || requested.set(true)))
+    }
+
+    fn pause_frame_requests(&self) {
+        self.0.lock().frame_requested.set(false);
+    }
 
     fn on_input(&self, callback: Box<dyn FnMut(crate::PlatformInput) -> DispatchEventResult>) {
         self.0.lock().input_callback = Some(callback)
