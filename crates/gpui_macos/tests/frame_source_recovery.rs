@@ -9,6 +9,7 @@ mod display_link;
 fn main() {
     #[cfg(target_os = "macos")]
     {
+        use core_graphics::display::kCGNullDirectDisplayID;
         use display_link::WindowFrameSource;
         use std::{
             ffi::c_void,
@@ -31,10 +32,10 @@ fn main() {
         );
 
         // Force a real failed subscription without depending on the runner
-        // having an active screen. This is not a valid CGDirectDisplayID.
+        // having an active screen. The null ID never identifies display hardware.
         for _ in 0..2 {
             let error = source
-                .start(u32::MAX)
+                .start(kCGNullDirectDisplayID)
                 .expect_err("invalid display must fail");
             assert!(!source.is_running());
             assert!(
