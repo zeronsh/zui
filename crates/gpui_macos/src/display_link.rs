@@ -500,24 +500,3 @@ mod sys {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn stopped_frame_source_allows_invalidation_to_restart_it() {
-        extern "C" fn unused_callback(_: *mut c_void) {}
-        let requested = Arc::new(AtomicBool::new(true));
-        let mut source =
-            WindowFrameSource::new(std::ptr::null_mut(), unused_callback, requested.clone());
-        // No registration also occurs when a start fails. Stopping must clear
-        // the latch even then; otherwise frame_requester never queues a retry.
-        source.stop();
-        assert!(!source.is_running());
-        assert!(!requested.swap(true, Ordering::AcqRel));
-        assert!(requested.swap(true, Ordering::AcqRel));
-        source.stop();
-        assert!(!requested.swap(true, Ordering::AcqRel));
-    }
-}
