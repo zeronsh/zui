@@ -1674,13 +1674,39 @@ impl PlatformWindow for MacWindow {
     }
 
     fn frame_requester(&self) -> Option<Rc<dyn Fn()>> {
-        let requested = self.0.lock().frame_requested.clone();
-        Some(Rc::new(move || requested.store(true, Ordering::Release)))
+        let state = self.0.lock();
+        let requested = state.frame_requested.clone();
+        let executor = state.foreground_executor.clone();
+        let window = Arc::downgrade(&self.0);
+        Some(Rc::new(move || {
+            if !requested.swap(true, Ordering::AcqRel) {
+                // Invalidation can occur inside a platform callback. Restart
+                // after it returns so we never recursively lock WindowState.
+                let window = window.clone();
+                executor
+                    .spawn(async move {
+                        if let Some(window) = window.upgrade() {
+                            let mut state = window.lock();
+                            if !state.closed.load(Ordering::Acquire)
+                                && state.frame_requested.load(Ordering::Acquire)
+                                && !state
+                                    .frame_source
+                                    .as_ref()
+                                    .is_some_and(WindowFrameSource::is_running)
+                            {
+                                state.start_display_link();
+                            }
+                        }
+                    })
+                    .detach();
+            }
+        }))
     }
 
     fn pause_frame_requests(&self) {
         let mut state = self.0.lock();
         state.frame_requested.store(false, Ordering::Release);
+        state.stop_display_link();
         state.renderer.trim_idle_resources();
     }
 
