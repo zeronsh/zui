@@ -1155,7 +1155,7 @@ impl MacWindow {
             let mut windows = Vec::new();
             for i in 0..count {
                 let window: id = msg_send![native_windows, objectAtIndex: i];
-                if msg_send![window, isKindOfClass: WINDOW_CLASS] {
+                if is_gpui_window(window) {
                     windows.push(get_window_state(&*window));
                 }
             }
