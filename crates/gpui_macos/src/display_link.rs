@@ -275,13 +275,15 @@ impl WindowFrameSource {
 
     pub fn start(&mut self, display_id: CGDirectDisplayID) -> Result<()> {
         self.stop();
-        self.requested.store(true, Ordering::Release);
         let subscriber_id = subscribe(
             display_id,
             self.frame_requests.clone(),
             self.requested.clone(),
         )?;
         self.registration = Some((display_id, subscriber_id));
+        // Only latch the request once a source can actually deliver it. A
+        // failed start must allow the next invalidation to retry.
+        self.requested.store(true, Ordering::Release);
         Ok(())
     }
 
@@ -290,6 +292,7 @@ impl WindowFrameSource {
     }
 
     pub fn stop(&mut self) {
+        self.requested.store(false, Ordering::Release);
         if let Some((display_id, subscriber_id)) = self.registration.take() {
             unsubscribe(display_id, subscriber_id);
         }
@@ -430,6 +433,7 @@ mod sys {
             callback: CVDisplayLinkOutputCallback,
             user_info: *mut c_void,
         ) -> i32;
+        pub fn CVDisplayLinkIsRunning(display_link: &DisplayLinkRef) -> u8;
         pub fn CVDisplayLinkStart(display_link: &mut DisplayLinkRef) -> i32;
         pub fn CVDisplayLinkStop(display_link: &mut DisplayLinkRef) -> i32;
         pub fn CVDisplayLinkRelease(display_link: *mut CVDisplayLink);
@@ -471,7 +475,13 @@ mod sys {
         pub unsafe fn start(&mut self) -> Result<()> {
             unsafe {
                 let code = CVDisplayLinkStart(self);
-                anyhow::ensure!(code == 0, "could not start display link, code: {}", code);
+                // A rapid idle stop/start can find CoreVideo still running.
+                // Keep the subscriber in that case instead of losing all frames.
+                anyhow::ensure!(
+                    code == 0 || CVDisplayLinkIsRunning(self) != 0,
+                    "could not start display link, code: {}",
+                    code
+                );
                 Ok(())
             }
         }
@@ -480,7 +490,11 @@ mod sys {
         pub unsafe fn stop(&mut self) -> Result<()> {
             unsafe {
                 let code = CVDisplayLinkStop(self);
-                anyhow::ensure!(code == 0, "could not stop display link, code: {}", code);
+                anyhow::ensure!(
+                    code == 0 || CVDisplayLinkIsRunning(self) == 0,
+                    "could not stop display link, code: {}",
+                    code
+                );
                 Ok(())
             }
         }
