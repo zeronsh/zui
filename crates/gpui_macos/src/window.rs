@@ -680,6 +680,9 @@ impl MacWindowState {
     }
 
     fn stop_display_link(&mut self) {
+        // Also clear the latch before the first source exists: AppKit can
+        // temporarily report no screen during sleep or display reconfiguration.
+        self.frame_requested.store(false, Ordering::Release);
         if let Some(frame_source) = self.frame_source.as_mut() {
             frame_source.stop();
         }
@@ -1137,6 +1140,35 @@ impl MacWindow {
             }
 
             window_handles
+        }
+    }
+
+    pub(crate) fn restart_frame_sources() {
+        // Wake notifications are delivered asynchronously on the main queue,
+        // outside platform/window callbacks. Collect all windows first, then
+        // stop ALL subscribers before restarting any: windows share one
+        // CVDisplayLink per display, which may have stopped during sleep.
+        let windows = unsafe {
+            let app = NSApplication::sharedApplication(nil);
+            let native_windows: id = msg_send![app, windows];
+            let count: NSUInteger = msg_send![native_windows, count];
+            let mut windows = Vec::new();
+            for i in 0..count {
+                let window: id = msg_send![native_windows, objectAtIndex: i];
+                if msg_send![window, isKindOfClass: WINDOW_CLASS] {
+                    windows.push(get_window_state(&*window));
+                }
+            }
+            windows
+        };
+        for window in &windows {
+            window.lock().stop_display_link();
+        }
+        for window in windows {
+            let mut state = window.lock();
+            if !state.closed.load(Ordering::Acquire) {
+                state.start_display_link();
+            }
         }
     }
 
