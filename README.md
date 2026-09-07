@@ -30,6 +30,10 @@ Paths line up as long as the touched crates exist here.
 
 ## License
 
-`gpui` and most crates here are Apache-2.0 (see `LICENSE-APACHE`); the `path`,
-`zlog`, and `ztracing` crates are GPL-3.0-or-later (see `LICENSE-GPL`), matching
-their licensing in the Zed repository.
+`gpui` and most crates here are Apache-2.0 (see `LICENSE-APACHE`). The `path`
+crate remains GPL-3.0-or-later (see `LICENSE-GPL`), matching its licensing in
+the Zed repository. Individual dependencies retain their own licenses.
+
+The optional sum-tree profiling annotations and the `ztracing`,
+`ztracing_macro`, and `zlog` crates have been removed. Sum-tree tests use
+`env_logger` for logging.

@@ -17,19 +17,13 @@ doctest = false
 heapless.workspace = true
 rayon.workspace = true
 log.workspace = true
-ztracing.workspace = true
-tracing.workspace = true
 proptest = { workspace = true, optional = true }
 
 [dev-dependencies]
 ctor.workspace = true
 rand.workspace = true
 proptest.workspace = true
-zlog.workspace = true
-
-
-[package.metadata.cargo-machete]
-ignored = ["tracing"]
+env_logger.workspace = true
 
 [features]
 test-support = ["proptest"]

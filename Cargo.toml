@@ -24,9 +24,6 @@ members = [
     "crates/sum_tree",
     "crates/util",
     "crates/util_macros",
-    "crates/zlog",
-    "crates/ztracing",
-    "crates/ztracing_macro",
     "tooling/perf",
 ]
 
@@ -243,9 +240,6 @@ web-time = "1.1.0"
 wgpu = "29.0.4"
 which = "6.0.0"
 windows-core = "0.61"
-zlog = { path = "crates/zlog" }
-ztracing = { path = "crates/ztracing" }
-ztracing_macro = { path = "crates/ztracing_macro" }
 
 [workspace.dependencies.windows]
 version = "0.61"

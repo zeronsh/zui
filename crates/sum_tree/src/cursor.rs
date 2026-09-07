@@ -1,7 +1,6 @@
 use super::*;
 use heapless::Vec as ArrayVec;
 use std::{cmp::Ordering, mem, sync::Arc};
-use ztracing::instrument;
 
 #[derive(Clone)]
 struct StackEntry<'a, T: Item, D> {
@@ -212,7 +211,6 @@ where
     }
 
     #[track_caller]
-    #[instrument(skip_all)]
     pub fn prev(&mut self) {
         self.search_backward(|_| true)
     }
@@ -404,7 +402,6 @@ where
 {
     /// Returns whether we found the item you were seeking for.
     #[track_caller]
-    #[instrument(skip_all)]
     pub fn seek<Target>(&mut self, pos: &Target, bias: Bias) -> bool
     where
         Target: SeekTarget<'a, T::Summary, D>,
@@ -419,7 +416,6 @@ where
     ///
     /// If we did not seek before, use seek instead in that case.
     #[track_caller]
-    #[instrument(skip_all)]
     pub fn seek_forward<Target>(&mut self, pos: &Target, bias: Bias) -> bool
     where
         Target: SeekTarget<'a, T::Summary, D>,
@@ -461,7 +457,6 @@ where
 
     /// Returns whether we found the item you were seeking for.
     #[track_caller]
-    #[instrument(skip_all)]
     fn seek_internal(
         &mut self,
         target: &dyn SeekTarget<'a, T::Summary, D>,
