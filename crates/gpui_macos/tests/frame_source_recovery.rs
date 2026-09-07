@@ -24,7 +24,7 @@ fn main() {
     #[cfg(target_os = "macos")]
     {
         use core_graphics::display::CGMainDisplayID;
-        use display_link::WindowFrameSource;
+        use display_link::{WindowFrameSource, retire_display_links_after_wake};
         use std::{
             ffi::c_void,
             sync::{
@@ -47,17 +47,36 @@ fn main() {
 
         // Exercise the full failed-subscription path, including registry cleanup.
         let display_id = unsafe { CGMainDisplayID() };
-        for _ in 0..2 {
-            let error = source
-                .start(display_id)
-                .expect_err("injected CoreVideo start failure must propagate");
-            assert!(!source.is_running());
-            assert!(
-                !requested.swap(true, Ordering::AcqRel),
-                "a failed start must allow the next invalidation to retry: {error}"
-            );
-        }
+        let error = source
+            .start(display_id)
+            .expect_err("injected CoreVideo start failure must propagate");
+        assert!(!source.is_running());
+        assert!(
+            !requested.swap(true, Ordering::AcqRel),
+            "a failed start must allow the next invalidation to retry: {error}"
+        );
+        assert_eq!(
+            retire_display_links_after_wake(),
+            1,
+            "wake recovery must retire the cached CoreVideo object"
+        );
+        assert_eq!(
+            retire_display_links_after_wake(),
+            0,
+            "retiring an already-empty registry must be harmless"
+        );
+
+        // The next attempt must recreate the registry entry and still leave
+        // another invalidation able to retry when startup fails.
+        let error = source
+            .start(display_id)
+            .expect_err("injected CoreVideo start failure must propagate");
+        assert!(!source.is_running());
+        assert!(
+            !requested.swap(true, Ordering::AcqRel),
+            "a failed fresh-link start must allow another retry: {error}"
+        );
         assert_eq!(START_ATTEMPTS.load(Ordering::Relaxed), 2);
-        println!("PASS: stopped and failed frame sources allow redraw requests to retry");
+        println!("PASS: wake retires cached links and failed frame sources allow redraw retries");
     }
 }

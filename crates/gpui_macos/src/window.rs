@@ -1164,6 +1164,11 @@ impl MacWindow {
         for window in &windows {
             window.lock().stop_display_link();
         }
+        // A CoreVideo link may claim to restart successfully after wake while
+        // never delivering another callback. Do not reuse the pre-sleep
+        // objects: retire them after every subscriber has stopped so each
+        // visible window reconnects through a fresh display link below.
+        crate::display_link::retire_display_links_after_wake();
         for window in windows {
             let mut state = window.lock();
             if !state.closed.load(Ordering::Acquire) {

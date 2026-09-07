@@ -28,13 +28,13 @@
 //!   stop links directly, so interleaved starts/stops of windows sharing a
 //!   display cannot conflict.
 //!
-//! One tradeoff of immortal entries: a link created for a given
-//! `CGDirectDisplayID` is reused forever, including after the display is
-//! unplugged and one reappears with the same id, or after mode/refresh-rate
-//! changes. `CVDisplayLink` looks up display timing dynamically, so a cached
-//! link keeps pacing correctly; if that ever proves untrue the fix is to
-//! also refresh entries from a display-reconfiguration callback, not to
-//! release links (which would reintroduce the teardown race).
+//! Links are normally reused for the process lifetime. After system/display
+//! wake or session activation, however, CoreVideo can report that a restarted
+//! link is running without delivering another callback. Wake recovery retires
+//! those stopped links and creates fresh ones. Retired links are intentionally
+//! leaked rather than released because a final output callback may still be
+//! executing. Wake is rare, so this trades a small bounded-per-wake native
+//! allocation for reliable rendering without reintroducing the teardown race.
 //!
 //! Lock ordering: the output callback runs on the link's io thread and takes
 //! the registry lock, possibly while holding CVDisplayLink-internal locks. To
@@ -235,6 +235,42 @@ fn unsubscribe(display_id: CGDirectDisplayID, subscriber_id: SubscriberId) {
         // no subscribers for this display and does nothing.
         unsafe { link.stop().log_err() };
     }
+}
+
+/// Retire all stopped display links after every window has unsubscribed.
+///
+/// A link can survive sleep in a state where `CVDisplayLinkStart` and
+/// `CVDisplayLinkIsRunning` report success but no output callback is delivered.
+/// Reusing that object leaves every window permanently waiting for a frame.
+/// The old objects cannot safely be released (see the module-level lifetime
+/// notes), so remove them from the registry and leak their final retain. The
+/// next subscription creates a genuinely fresh CoreVideo link.
+pub(crate) fn retire_display_links_after_wake() -> usize {
+    debug_assert_main_thread();
+
+    let retired = {
+        let mut registry = lock_registry();
+        if registry
+            .displays
+            .values()
+            .any(|entry| !entry.subscribers.is_empty())
+        {
+            log::error!(
+                "refusing to retire macOS display links while subscribers are still registered"
+            );
+            return 0;
+        }
+        std::mem::take(&mut registry.displays)
+    };
+    let count = retired.len();
+    for (_, mut entry) in retired {
+        // stop() is idempotent for an already-stopped link. Ignore an error:
+        // the object is removed from callback routing and deliberately kept
+        // alive below regardless of CoreVideo's reported state.
+        unsafe { entry.link.stop().log_err() };
+        std::mem::forget(entry.link);
+    }
+    count
 }
 
 /// A per-window source of frame requests, paced by the display the window is
