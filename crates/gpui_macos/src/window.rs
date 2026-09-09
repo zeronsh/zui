@@ -566,7 +566,7 @@ struct MacWindowState {
     renderer: renderer::Renderer,
     overlay_renderer: Option<renderer::Renderer>,
     overlay_view: Option<NonNull<Object>>,
-    overlay_backdrops: Vec<NonNull<Object>>,
+    overlay_backdrops: Vec<(NonNull<Object>, f32)>,
     overlay_capture_input: Arc<AtomicBool>,
     overlay_size: Option<(Size<Pixels>, f32)>,
     request_frame_callback: Option<Box<dyn FnMut(RequestFrameOptions)>>,
@@ -1947,13 +1947,13 @@ impl PlatformWindow for MacWindow {
         // Keep these effect views below GPUI text and above native children.
         unsafe {
             while state.overlay_backdrops.len() > overlay.backdrop_blurs.len() {
-                let view = state.overlay_backdrops.pop().unwrap().as_ptr();
+                let view = state.overlay_backdrops.pop().unwrap().0.as_ptr();
                 let _: () = msg_send![view, removeFromSuperview];
             }
             let parent = state.native_view.as_ptr();
             let plane = state.overlay_view.unwrap().as_ptr();
             for (index, blur) in overlay.backdrop_blurs.iter().enumerate() {
-                let view = if let Some(view) = state.overlay_backdrops.get(index) {
+                let view = if let Some((view, _)) = state.overlay_backdrops.get(index) {
                     view.as_ptr()
                 } else {
                     let view: id = msg_send![BACKDROP_VIEW_CLASS, alloc];
@@ -1969,7 +1969,9 @@ impl PlatformWindow for MacWindow {
                     NSVisualEffectView::setState_(view, NSVisualEffectState::Active);
                     view.setWantsLayer(YES);
                     parent.addSubview_(view.autorelease());
-                    state.overlay_backdrops.push(NonNull::new(view).unwrap());
+                    state
+                        .overlay_backdrops
+                        .push((NonNull::new(view).unwrap(), blur.blur_radius.0));
                     view
                 };
                 let bounds = blur.bounds.intersect(&blur.content_mask.bounds);
@@ -1977,7 +1979,12 @@ impl PlatformWindow for MacWindow {
                 let width = (bounds.size.width.0 / scale).max(0.) as f64;
                 let height = (bounds.size.height.0 / scale).max(0.) as f64;
                 let y = f32::from(size.height) as f64 - (bounds.origin.y.0 / scale) as f64 - height;
-                view.setFrame_(NSRect::new(NSPoint::new(x, y), NSSize::new(width, height)));
+                let frame = NSRect::new(NSPoint::new(x, y), NSSize::new(width, height));
+                let _: () = msg_send![view, setFrame: frame];
+                let peak = &mut state.overlay_backdrops[index].1;
+                *peak = peak.max(blur.blur_radius.0);
+                let alpha = (blur.blur_radius.0 / peak.max(1.0)).clamp(0.0, 1.0) as f64;
+                let _: () = msg_send![view, setAlphaValue: alpha];
                 let layer: id = msg_send![view, layer];
                 let radius = (blur.corner_radii.top_left.0 / scale) as f64;
                 let _: () = msg_send![layer, setCornerRadius: radius];
@@ -1985,9 +1992,8 @@ impl PlatformWindow for MacWindow {
                 let _: () = msg_send![parent, addSubview: view positioned: NSWindowOrderingMode::NSWindowBelow relativeTo: plane];
             }
         }
-        // The native effects supply the backdrop; sampling the transparent
-        // overlay texture here would erase it and leave unblurred web content.
-        overlay.backdrop_blurs.clear();
+        // Keep the Metal blur too: overlapping GPUI popovers still need to
+        // blur earlier overlay content, while native effects supply the page.
         state.renderer.draw(&base);
         if visible {
             state.overlay_renderer.as_mut().unwrap().draw(&overlay);
