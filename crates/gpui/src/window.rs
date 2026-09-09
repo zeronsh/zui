@@ -6945,6 +6945,67 @@ mod tests {
         assert!(!platform.simulate_display_tick());
     }
 
+    struct NativeFrameProbe {
+        desired: Rc<Cell<u32>>,
+        displayed: Rc<Cell<u32>>,
+        calls: Rc<Cell<u32>>,
+    }
+
+    impl Render for NativeFrameProbe {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let desired = self.desired.get();
+            let displayed = self.displayed.clone();
+            let calls = self.calls.clone();
+            canvas(
+                |_, _, _| (),
+                move |_, _, window, _| {
+                    window.on_present(move || {
+                        displayed.set(desired);
+                        calls.set(calls.get() + 1);
+                    });
+                },
+            )
+            .size_full()
+        }
+    }
+
+    #[test]
+    fn native_updates_wait_for_the_presented_frame() {
+        let mut cx = TestAppContext::single();
+        let desired = Rc::new(Cell::new(1));
+        let displayed = Rc::new(Cell::new(0));
+        let calls = Rc::new(Cell::new(0));
+        let handle = cx.add_window(|_, _| NativeFrameProbe {
+            desired: desired.clone(),
+            displayed: displayed.clone(),
+            calls: calls.clone(),
+        });
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.draw(cx).clear();
+            assert_eq!(
+                displayed.get(),
+                0,
+                "a hit-test paint must not move native content"
+            );
+            desired.set(2);
+            window.refresh();
+            window.draw(cx).clear();
+            assert_eq!(displayed.get(), 0);
+            window.present();
+            assert_eq!(
+                displayed.get(),
+                2,
+                "native content must match the latest scene"
+            );
+            assert_eq!(
+                calls.get(),
+                1,
+                "superseded frame callbacks must be discarded"
+            );
+        })
+        .unwrap();
+    }
+
     struct FocusForwarder {
         a: FocusHandle,
         b: FocusHandle,
