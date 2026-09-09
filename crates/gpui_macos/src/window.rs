@@ -81,6 +81,7 @@ static mut WINDOW_CLASS: *const Class = ptr::null();
 static mut PANEL_CLASS: *const Class = ptr::null();
 static mut VIEW_CLASS: *const Class = ptr::null();
 static mut OVERLAY_VIEW_CLASS: *const Class = ptr::null();
+static mut BACKDROP_VIEW_CLASS: *const Class = ptr::null();
 static mut BLURRED_VIEW_CLASS: *const Class = ptr::null();
 
 #[allow(non_upper_case_globals)]
@@ -353,6 +354,17 @@ unsafe fn build_classes() {
             }
             decl.register()
         };
+        BACKDROP_VIEW_CLASS = {
+            let mut decl = ClassDecl::new("GPUIBackdropView", class!(NSVisualEffectView)).unwrap();
+            extern "C" fn passthrough(_: &Object, _: Sel, _: NSPoint) -> id {
+                nil
+            }
+            decl.add_method(
+                sel!(hitTest:),
+                passthrough as extern "C" fn(&Object, Sel, NSPoint) -> id,
+            );
+            decl.register()
+        };
         BLURRED_VIEW_CLASS = {
             let mut decl = ClassDecl::new("BlurredView", class!(NSVisualEffectView)).unwrap();
             decl.add_method(
@@ -554,6 +566,7 @@ struct MacWindowState {
     renderer: renderer::Renderer,
     overlay_renderer: Option<renderer::Renderer>,
     overlay_view: Option<NonNull<Object>>,
+    overlay_backdrops: Vec<NonNull<Object>>,
     overlay_capture_input: Arc<AtomicBool>,
     overlay_size: Option<(Size<Pixels>, f32)>,
     request_frame_callback: Option<Box<dyn FnMut(RequestFrameOptions)>>,
@@ -963,6 +976,7 @@ impl MacWindow {
                 ),
                 overlay_renderer: None,
                 overlay_view: None,
+                overlay_backdrops: Vec::new(),
                 overlay_capture_input: Arc::new(AtomicBool::new(false)),
                 overlay_size: None,
                 request_frame_callback: None,
@@ -1928,6 +1942,52 @@ impl PlatformWindow for MacWindow {
             }
             state.overlay_size = Some((size, scale));
         }
+        // A Metal texture cannot sample pixels from a sibling WKWebView.
+        // AppKit's within-window effects include native content in the blur.
+        // Keep these effect views below GPUI text and above native children.
+        unsafe {
+            while state.overlay_backdrops.len() > overlay.backdrop_blurs.len() {
+                let view = state.overlay_backdrops.pop().unwrap().as_ptr();
+                let _: () = msg_send![view, removeFromSuperview];
+            }
+            let parent = state.native_view.as_ptr();
+            let plane = state.overlay_view.unwrap().as_ptr();
+            for (index, blur) in overlay.backdrop_blurs.iter().enumerate() {
+                let view = if let Some(view) = state.overlay_backdrops.get(index) {
+                    view.as_ptr()
+                } else {
+                    let view: id = msg_send![BACKDROP_VIEW_CLASS, alloc];
+                    let view = NSView::initWithFrame_(
+                        view,
+                        NSRect::new(NSPoint::new(0., 0.), NSSize::new(0., 0.)),
+                    );
+                    NSVisualEffectView::setMaterial_(view, NSVisualEffectMaterial::Popover);
+                    NSVisualEffectView::setBlendingMode_(
+                        view,
+                        NSVisualEffectBlendingMode::WithinWindow,
+                    );
+                    NSVisualEffectView::setState_(view, NSVisualEffectState::Active);
+                    view.setWantsLayer(YES);
+                    parent.addSubview_(view.autorelease());
+                    state.overlay_backdrops.push(NonNull::new(view).unwrap());
+                    view
+                };
+                let bounds = blur.bounds.intersect(&blur.content_mask.bounds);
+                let x = (bounds.origin.x.0 / scale) as f64;
+                let width = (bounds.size.width.0 / scale).max(0.) as f64;
+                let height = (bounds.size.height.0 / scale).max(0.) as f64;
+                let y = f32::from(size.height) as f64 - (bounds.origin.y.0 / scale) as f64 - height;
+                view.setFrame_(NSRect::new(NSPoint::new(x, y), NSSize::new(width, height)));
+                let layer: id = msg_send![view, layer];
+                let radius = (blur.corner_radii.top_left.0 / scale) as f64;
+                let _: () = msg_send![layer, setCornerRadius: radius];
+                let _: () = msg_send![layer, setMasksToBounds: YES];
+                let _: () = msg_send![parent, addSubview: view positioned: NSWindowOrderingMode::NSWindowBelow relativeTo: plane];
+            }
+        }
+        // The native effects supply the backdrop; sampling the transparent
+        // overlay texture here would erase it and leave unblurred web content.
+        overlay.backdrop_blurs.clear();
         state.renderer.draw(&base);
         if visible {
             state.overlay_renderer.as_mut().unwrap().draw(&overlay);
