@@ -221,8 +221,14 @@ pub struct PathRasterizationVertex {
 impl MetalRenderer {
     /// Creates a new MetalRenderer with a CAMetalLayer for window-based rendering.
     pub fn new(instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>, transparent: bool) -> Self {
-        let device = Self::create_device();
+        Self::new_window_renderer(Self::create_device(), instance_buffer_pool, transparent)
+    }
 
+    fn new_window_renderer(
+        device: metal::Device,
+        instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
+        transparent: bool,
+    ) -> Self {
         let layer = metal::MetalLayer::new();
         layer.set_device(&device);
         layer.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
@@ -459,7 +465,8 @@ impl MetalRenderer {
 
     /// A transparent renderer must resolve the same atlas IDs as the base scene.
     pub(crate) fn new_overlay(&self) -> Self {
-        let mut renderer = Self::new(self.instance_buffer_pool.clone(), true);
+        let mut renderer =
+            Self::new_window_renderer(self.device.clone(), self.instance_buffer_pool.clone(), true);
         renderer.sprite_atlas = self.sprite_atlas.clone();
         renderer
     }

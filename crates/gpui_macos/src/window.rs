@@ -114,7 +114,8 @@ const NSDragOperationCopy: NSDragOperation = 1;
 // This class uses the same window-state ownership as GPUIView. It does not
 // become a first responder; interactive overlay events go through GPUIView.
 extern "C" fn overlay_hit_test(this: &Object, _: Sel, _: NSPoint) -> id {
-    let active = unsafe { &*(*this.get_ivar::<*const AtomicBool>(OVERLAY_INPUT_IVAR)) };
+    let active =
+        unsafe { &*(*this.get_ivar::<*const c_void>(OVERLAY_INPUT_IVAR) as *const AtomicBool) };
     if active.load(Ordering::Acquire) {
         this as *const Object as id
     } else {
@@ -321,7 +322,7 @@ unsafe fn build_classes() {
         };
         OVERLAY_VIEW_CLASS = {
             let mut decl = ClassDecl::new("GPUIOverlayView", class!(NSView)).unwrap();
-            decl.add_ivar::<*const AtomicBool>(OVERLAY_INPUT_IVAR);
+            decl.add_ivar::<*const c_void>(OVERLAY_INPUT_IVAR);
             decl.add_ivar::<*mut c_void>(WINDOW_STATE_IVAR);
             decl.add_method(
                 sel!(dealloc),
@@ -1967,7 +1968,7 @@ impl PlatformWindow for MacWindow {
             );
             (*view).set_ivar(
                 OVERLAY_INPUT_IVAR,
-                Arc::into_raw(state.overlay_capture_input.clone()),
+                Arc::into_raw(state.overlay_capture_input.clone()) as *const c_void,
             );
             let mut renderer = state.renderer.new_overlay();
             let size = state.content_size();
@@ -2209,7 +2210,7 @@ extern "C" fn dealloc_window(this: &Object, _: Sel) {
 
 extern "C" fn dealloc_overlay_view(this: &Object, _: Sel) {
     unsafe {
-        let active: *const AtomicBool = *this.get_ivar(OVERLAY_INPUT_IVAR);
+        let active = *this.get_ivar::<*const c_void>(OVERLAY_INPUT_IVAR) as *const AtomicBool;
         drop(Arc::from_raw(active));
         drop_window_state(this);
         let _: () = msg_send![super(this, class!(NSView)), dealloc];
