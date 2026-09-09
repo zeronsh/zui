@@ -75,10 +75,12 @@ use std::{
 };
 
 const WINDOW_STATE_IVAR: &str = "windowState";
+const OVERLAY_INPUT_IVAR: &str = "overlayInputActive";
 
 static mut WINDOW_CLASS: *const Class = ptr::null();
 static mut PANEL_CLASS: *const Class = ptr::null();
 static mut VIEW_CLASS: *const Class = ptr::null();
+static mut OVERLAY_VIEW_CLASS: *const Class = ptr::null();
 static mut BLURRED_VIEW_CLASS: *const Class = ptr::null();
 
 #[allow(non_upper_case_globals)]
@@ -109,6 +111,23 @@ type NSDragOperation = NSUInteger;
 const NSDragOperationNone: NSDragOperation = 0;
 #[allow(non_upper_case_globals)]
 const NSDragOperationCopy: NSDragOperation = 1;
+// This class uses the same window-state ownership as GPUIView. It does not
+// become a first responder; interactive overlay events go through GPUIView.
+extern "C" fn overlay_hit_test(this: &Object, _: Sel, _: NSPoint) -> id {
+    let active =
+        unsafe { &*(*this.get_ivar::<*const c_void>(OVERLAY_INPUT_IVAR) as *const AtomicBool) };
+    if active.load(Ordering::Acquire) {
+        this as *const Object as id
+    } else {
+        nil
+    }
+}
+extern "C" fn overlay_event(this: &Object, selector: Sel, event: id) {
+    let state = unsafe { get_window_state(this) };
+    let view = state.lock().native_view;
+    handle_view_event(unsafe { view.as_ref() }, selector, event);
+}
+
 #[derive(PartialEq)]
 pub enum UserTabbingPreference {
     Never,
@@ -299,6 +318,39 @@ unsafe fn build_classes() {
                 sel!(characterIndexForPoint:),
                 character_index_for_point as extern "C" fn(&Object, Sel, NSPoint) -> u64,
             );
+            decl.register()
+        };
+        OVERLAY_VIEW_CLASS = {
+            let mut decl = ClassDecl::new("GPUIOverlayView", class!(NSView)).unwrap();
+            decl.add_ivar::<*const c_void>(OVERLAY_INPUT_IVAR);
+            decl.add_ivar::<*mut c_void>(WINDOW_STATE_IVAR);
+            decl.add_method(
+                sel!(dealloc),
+                dealloc_overlay_view as extern "C" fn(&Object, Sel),
+            );
+            decl.add_method(
+                sel!(hitTest:),
+                overlay_hit_test as extern "C" fn(&Object, Sel, NSPoint) -> id,
+            );
+            for selector in [
+                sel!(mouseDown:),
+                sel!(mouseUp:),
+                sel!(rightMouseDown:),
+                sel!(rightMouseUp:),
+                sel!(otherMouseDown:),
+                sel!(otherMouseUp:),
+                sel!(mouseMoved:),
+                sel!(mouseExited:),
+                sel!(mouseDragged:),
+                sel!(rightMouseDragged:),
+                sel!(otherMouseDragged:),
+                sel!(scrollWheel:),
+                sel!(magnifyWithEvent:),
+                sel!(swipeWithEvent:),
+                sel!(pressureChangeWithEvent:),
+            ] {
+                decl.add_method(selector, overlay_event as extern "C" fn(&Object, Sel, id));
+            }
             decl.register()
         };
         BLURRED_VIEW_CLASS = {
@@ -500,6 +552,10 @@ struct MacWindowState {
     frame_source: Option<WindowFrameSource>,
     frame_requested: Arc<AtomicBool>,
     renderer: renderer::Renderer,
+    overlay_renderer: Option<renderer::Renderer>,
+    overlay_view: Option<NonNull<Object>>,
+    overlay_capture_input: Arc<AtomicBool>,
+    overlay_size: Option<(Size<Pixels>, f32)>,
     request_frame_callback: Option<Box<dyn FnMut(RequestFrameOptions)>>,
     event_callback: Option<Box<dyn FnMut(PlatformInput) -> gpui::DispatchEventResult>>,
     activate_callback: Option<Box<dyn FnMut(bool)>>,
@@ -905,6 +961,10 @@ impl MacWindow {
                     bounds.size.map(|pixels| pixels.as_f32()),
                     false,
                 ),
+                overlay_renderer: None,
+                overlay_view: None,
+                overlay_capture_input: Arc::new(AtomicBool::new(false)),
+                overlay_size: None,
                 request_frame_callback: None,
                 event_callback: None,
                 activate_callback: None,
@@ -1204,6 +1264,9 @@ impl Drop for MacWindow {
     fn drop(&mut self) {
         let mut this = self.0.lock();
         this.renderer.destroy();
+        if let Some(renderer) = &this.overlay_renderer {
+            renderer.destroy();
+        }
         let window = this.native_window;
         let sheet_parent = this.sheet_parent.take();
         this.frame_source.take();
@@ -1836,6 +1899,96 @@ impl PlatformWindow for MacWindow {
         this.renderer.draw(scene);
     }
 
+    fn draw_layered(&self, scene: &gpui::Scene, overlay_start: usize, capture_input: bool) {
+        let mut state = self.0.lock();
+        if state.overlay_renderer.is_none() {
+            state.renderer.draw(scene);
+            return;
+        }
+        let split = overlay_start.min(scene.len());
+        let mut base = gpui::Scene::default();
+        base.replay(0..split, scene);
+        base.finish();
+        let mut overlay = gpui::Scene::default();
+        overlay.replay(split..scene.len(), scene);
+        overlay.finish();
+        let visible = !overlay.is_empty();
+        let active = capture_input && visible;
+        let was_active = state.overlay_capture_input.swap(active, Ordering::AcqRel);
+        let focus_chrome = active && !was_active;
+        let size = state.content_size();
+        let scale = state.scale_factor();
+        if state.overlay_size != Some((size, scale)) {
+            let renderer = state.overlay_renderer.as_mut().unwrap();
+            renderer.update_drawable_size(size.to_device_pixels(scale));
+            if let Some(layer) = renderer.layer() {
+                unsafe {
+                    let _: () = msg_send![layer, setContentsScale: scale as f64];
+                }
+            }
+            state.overlay_size = Some((size, scale));
+        }
+        state.renderer.draw(&base);
+        if visible {
+            state.overlay_renderer.as_mut().unwrap().draw(&overlay);
+        } else {
+            state
+                .overlay_renderer
+                .as_mut()
+                .unwrap()
+                .trim_idle_resources();
+        }
+        unsafe {
+            let view = state.overlay_view.unwrap().as_ptr();
+            let _: () = msg_send![view, setHidden: if visible { NO } else { YES }];
+        }
+        let window = state.native_window;
+        let view = state.native_view.as_ptr();
+        drop(state);
+        if focus_chrome {
+            unsafe {
+                let _: BOOL = msg_send![window, makeFirstResponder: view];
+            }
+        }
+    }
+
+    fn enable_scene_overlay(&self) -> anyhow::Result<()> {
+        let mut state = self.0.lock();
+        if state.overlay_renderer.is_some() {
+            return Ok(());
+        }
+        unsafe {
+            let parent = state.native_view.as_ptr();
+            let view: id = msg_send![OVERLAY_VIEW_CLASS, alloc];
+            let view = NSView::initWithFrame_(view, NSView::bounds(parent));
+            anyhow::ensure!(!view.is_null(), "Could not create the GPUI overlay view");
+            (*view).set_ivar(
+                WINDOW_STATE_IVAR,
+                Arc::into_raw(self.0.clone()) as *const c_void,
+            );
+            (*view).set_ivar(
+                OVERLAY_INPUT_IVAR,
+                Arc::into_raw(state.overlay_capture_input.clone()) as *const c_void,
+            );
+            let mut renderer = state.renderer.new_overlay();
+            let size = state.content_size();
+            let scale = state.scale_factor();
+            renderer.update_drawable_size(size.to_device_pixels(scale));
+            if let Some(layer) = renderer.layer() {
+                let _: () = msg_send![layer, setContentsScale: scale as f64];
+            }
+            view.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable);
+            view.setWantsLayer(YES);
+            let _: () = msg_send![view, setLayer: renderer.layer_ptr()];
+            let _: () = msg_send![view, setHidden: YES];
+            parent.addSubview_(view.autorelease());
+            state.overlay_view = NonNull::new(view);
+            state.overlay_size = Some((size, scale));
+            state.overlay_renderer = Some(renderer);
+        }
+        Ok(())
+    }
+
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
         self.0.lock().renderer.sprite_atlas().clone()
     }
@@ -2052,6 +2205,15 @@ extern "C" fn dealloc_window(this: &Object, _: Sel) {
     unsafe {
         drop_window_state(this);
         let _: () = msg_send![super(this, class!(NSWindow)), dealloc];
+    }
+}
+
+extern "C" fn dealloc_overlay_view(this: &Object, _: Sel) {
+    unsafe {
+        let active = *this.get_ivar::<*const c_void>(OVERLAY_INPUT_IVAR) as *const AtomicBool;
+        drop(Arc::from_raw(active));
+        drop_window_state(this);
+        let _: () = msg_send![super(this, class!(NSView)), dealloc];
     }
 }
 

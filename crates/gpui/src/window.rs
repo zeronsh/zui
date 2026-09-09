@@ -880,6 +880,8 @@ pub(crate) struct Frame {
     pub(crate) mouse_listeners: Vec<Option<AnyMouseListener>>,
     pub(crate) dispatch_tree: DispatchTree,
     pub(crate) scene: Scene,
+    overlay_scene_start: usize,
+    overlay_capture_input: bool,
     pub(crate) hitboxes: Vec<Hitbox>,
     pub(crate) window_control_hitboxes: Vec<(WindowControlArea, Hitbox)>,
     pub(crate) deferred_draws: Vec<DeferredDraw>,
@@ -926,6 +928,8 @@ impl Frame {
             mouse_listeners: Vec::new(),
             dispatch_tree,
             scene: Scene::default(),
+            overlay_scene_start: 0,
+            overlay_capture_input: false,
             hitboxes: Vec::new(),
             window_control_hitboxes: Vec::new(),
             deferred_draws: Vec::new(),
@@ -951,6 +955,8 @@ impl Frame {
         self.mouse_listeners.clear();
         self.dispatch_tree.clear();
         self.scene.clear();
+        self.overlay_scene_start = 0;
+        self.overlay_capture_input = false;
         self.input_handlers.clear();
         self.tooltip_requests.clear();
         self.cursor_styles.clear();
@@ -2887,9 +2893,18 @@ impl Window {
         self.invalidator.replace_views(views);
     }
 
+    /// Enable native-child compositing beneath deferred GPUI overlays.
+    pub fn enable_scene_overlay(&self) -> anyhow::Result<()> {
+        self.platform_window.enable_scene_overlay()
+    }
+
     #[profiling::function]
     fn present(&mut self) {
-        self.platform_window.draw(&self.rendered_frame.scene);
+        self.platform_window.draw_layered(
+            &self.rendered_frame.scene,
+            self.rendered_frame.overlay_scene_start,
+            self.rendered_frame.overlay_capture_input,
+        );
         #[cfg(feature = "input-latency-histogram")]
         self.input_latency_tracker.record_frame_presented();
         self.needs_present.set(false);
@@ -2990,6 +3005,13 @@ impl Window {
         #[cfg(any(feature = "inspector", debug_assertions))]
         self.paint_inspector(inspector_element, cx);
 
+        // Root paint is beneath native surfaces; deferred menus, prompts and
+        // tooltips use the transparent plane. Passive tooltips must not take
+        // input away from a webview merely because they have visible pixels.
+        self.next_frame.overlay_scene_start = self.next_frame.scene.len();
+        self.next_frame.overlay_capture_input = !self.next_frame.deferred_draws.is_empty()
+            || prompt_element.is_some()
+            || active_drag_element.is_some();
         self.paint_deferred_draws(cx);
 
         if let Some(mut prompt_element) = prompt_element {
