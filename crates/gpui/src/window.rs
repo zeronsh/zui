@@ -882,6 +882,7 @@ pub(crate) struct Frame {
     pub(crate) scene: Scene,
     overlay_scene_start: usize,
     overlay_capture_input: bool,
+    presentation_callbacks: Vec<Rc<dyn Fn()>>,
     pub(crate) hitboxes: Vec<Hitbox>,
     pub(crate) window_control_hitboxes: Vec<(WindowControlArea, Hitbox)>,
     pub(crate) deferred_draws: Vec<DeferredDraw>,
@@ -910,6 +911,7 @@ pub(crate) struct PrepaintStateIndex {
 #[derive(Clone, Default)]
 pub(crate) struct PaintIndex {
     scene_index: usize,
+    presentation_callbacks_index: usize,
     mouse_listeners_index: usize,
     input_handlers_index: usize,
     cursor_styles_index: usize,
@@ -930,6 +932,7 @@ impl Frame {
             scene: Scene::default(),
             overlay_scene_start: 0,
             overlay_capture_input: false,
+            presentation_callbacks: Vec::new(),
             hitboxes: Vec::new(),
             window_control_hitboxes: Vec::new(),
             deferred_draws: Vec::new(),
@@ -957,6 +960,7 @@ impl Frame {
         self.scene.clear();
         self.overlay_scene_start = 0;
         self.overlay_capture_input = false;
+        self.presentation_callbacks.clear();
         self.input_handlers.clear();
         self.tooltip_requests.clear();
         self.cursor_styles.clear();
@@ -2898,8 +2902,22 @@ impl Window {
         self.platform_window.enable_scene_overlay()
     }
 
+    /// Schedule a native-view update from an element's paint pass. Painting
+    /// can run solely to refresh input hit testing, without presenting a frame.
+    /// These updates run only when the corresponding scene reaches the screen,
+    /// and follow cached paint reuse just like its drawing primitives.
+    pub fn on_present(&mut self, callback: impl Fn() + 'static) {
+        self.invalidator.debug_assert_paint();
+        self.next_frame
+            .presentation_callbacks
+            .push(Rc::new(callback));
+    }
+
     #[profiling::function]
     fn present(&mut self) {
+        for callback in &self.rendered_frame.presentation_callbacks {
+            callback();
+        }
         self.platform_window.draw_layered(
             &self.rendered_frame.scene,
             self.rendered_frame.overlay_scene_start,
@@ -3303,6 +3321,7 @@ impl Window {
     pub(crate) fn paint_index(&self) -> PaintIndex {
         PaintIndex {
             scene_index: self.next_frame.scene.len(),
+            presentation_callbacks_index: self.next_frame.presentation_callbacks.len(),
             mouse_listeners_index: self.next_frame.mouse_listeners.len(),
             input_handlers_index: self.next_frame.input_handlers.len(),
             cursor_styles_index: self.next_frame.cursor_styles.len(),
@@ -3313,6 +3332,12 @@ impl Window {
     }
 
     pub(crate) fn reuse_paint(&mut self, range: Range<PaintIndex>) {
+        self.next_frame.presentation_callbacks.extend(
+            self.rendered_frame.presentation_callbacks
+                [range.start.presentation_callbacks_index..range.end.presentation_callbacks_index]
+                .iter()
+                .cloned(),
+        );
         self.next_frame.cursor_styles.extend(
             self.rendered_frame.cursor_styles
                 [range.start.cursor_styles_index..range.end.cursor_styles_index]
