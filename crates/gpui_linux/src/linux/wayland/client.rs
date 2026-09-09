@@ -737,7 +737,9 @@ impl WaylandClient {
 
                             client.common.appearance = appearance;
 
-                            for window in client.windows.values_mut() {
+                            let windows: Vec<_> = client.windows.values().cloned().collect();
+                            drop(client);
+                            for window in windows {
                                 window.set_appearance(appearance);
                             }
                         }
@@ -750,7 +752,9 @@ impl WaylandClient {
                             let mut client = client.borrow_mut();
                             client.common.button_layout = layout;
 
-                            for window in client.windows.values_mut() {
+                            let windows: Vec<_> = client.windows.values().cloned().collect();
+                            drop(client);
+                            for window in windows {
                                 window.set_button_layout();
                             }
                         }
