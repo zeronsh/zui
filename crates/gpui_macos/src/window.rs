@@ -2046,6 +2046,11 @@ impl PlatformWindow for MacWindow {
         let window = state.native_window;
         let view = state.native_view.as_ptr();
         drop(state);
+        // Commit transaction-backed drawables before another display callback
+        // requests a drawable; otherwise the main thread can exhaust the pool.
+        unsafe {
+            let _: () = msg_send![class!(CATransaction), flush];
+        }
         if focus_chrome {
             unsafe {
                 let _: BOOL = msg_send![window, makeFirstResponder: view];
