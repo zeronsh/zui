@@ -356,6 +356,23 @@ unsafe fn build_classes() {
         };
         BACKDROP_VIEW_CLASS = {
             let mut decl = ClassDecl::new("GPUIBackdropView", class!(NSVisualEffectView)).unwrap();
+            decl.add_ivar::<f64>("blurRadius");
+            extern "C" fn update_backdrop(this: &Object, _: Sel) {
+                unsafe {
+                    let _: () = msg_send![super(this, class!(NSVisualEffectView)), updateLayer];
+                    let layer: id = msg_send![this, layer];
+                    if !layer.is_null() {
+                        remove_layer_background_with_radius(
+                            layer,
+                            *this.get_ivar::<f64>("blurRadius"),
+                        );
+                    }
+                }
+            }
+            decl.add_method(
+                sel!(updateLayer),
+                update_backdrop as extern "C" fn(&Object, Sel),
+            );
             extern "C" fn passthrough(_: &Object, _: Sel, _: NSPoint) -> id {
                 nil
             }
@@ -1961,7 +1978,10 @@ impl PlatformWindow for MacWindow {
                         view,
                         NSRect::new(NSPoint::new(0., 0.), NSSize::new(0., 0.)),
                     );
-                    NSVisualEffectView::setMaterial_(view, NSVisualEffectMaterial::Popover);
+                    NSVisualEffectView::setMaterial_(
+                        view,
+                        NSVisualEffectMaterial::UnderWindowBackground,
+                    );
                     NSVisualEffectView::setBlendingMode_(
                         view,
                         NSVisualEffectBlendingMode::WithinWindow,
@@ -1983,6 +2003,11 @@ impl PlatformWindow for MacWindow {
                 let _: () = msg_send![view, setFrame: frame];
                 let peak = &mut state.overlay_backdrops[index].1;
                 *peak = peak.max(blur.blur_radius.0);
+                let native_radius = (blur.blur_radius.0 / scale) as f64;
+                if *(*view).get_ivar::<f64>("blurRadius") != native_radius {
+                    (*view).set_ivar("blurRadius", native_radius);
+                    let _: () = msg_send![view, setNeedsDisplay: YES];
+                }
                 let alpha = (blur.blur_radius.0 / peak.max(1.0)).clamp(0.0, 1.0) as f64;
                 let _: () = msg_send![view, setAlphaValue: alpha];
                 let layer: id = msg_send![view, layer];
@@ -3408,6 +3433,14 @@ extern "C" fn blurred_view_update_layer(this: &Object, _: Sel) {
 
 unsafe fn remove_layer_background(layer: id) {
     unsafe {
+        remove_layer_background_with_radius(layer, 60.0);
+    }
+}
+
+// The app supplies its own tint. Reuse the existing colorless native-blur
+// treatment for within-window overlays, with the radius from the GPUI scene.
+unsafe fn remove_layer_background_with_radius(layer: id, blur_radius: f64) {
+    unsafe {
         let _: () = msg_send![layer, setBackgroundColor:nil];
 
         let class_name: id = msg_send![layer, className];
@@ -3430,7 +3463,7 @@ unsafe fn remove_layer_background(layer: id) {
                 let description: id = msg_send![filter, description];
                 let hit: BOOL = msg_send![description, containsString: blur_test];
                 if hit == YES {
-                    let radius: id = msg_send![class!(NSNumber), numberWithDouble: 60.0f64];
+                    let radius: id = msg_send![class!(NSNumber), numberWithDouble: blur_radius];
                     let _: () =
                         msg_send![filter, setValue: radius forKey: ns_string("inputRadius")];
                     let _: () = msg_send![layer, setFilters: filters];
@@ -3469,7 +3502,7 @@ unsafe fn remove_layer_background(layer: id) {
             let count = NSArray::count(sublayers);
             for i in 0..count {
                 let sublayer = sublayers.objectAtIndex(i);
-                remove_layer_background(sublayer);
+                remove_layer_background_with_radius(sublayer, blur_radius);
             }
         }
     }
