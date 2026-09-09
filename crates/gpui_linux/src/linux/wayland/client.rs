@@ -739,7 +739,7 @@ impl WaylandClient {
 
                             let windows: Vec<_> = client.windows.values().cloned().collect();
                             drop(client);
-                            for window in windows {
+                            for mut window in windows {
                                 window.set_appearance(appearance);
                             }
                         }
