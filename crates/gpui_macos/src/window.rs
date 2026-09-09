@@ -81,6 +81,7 @@ static mut WINDOW_CLASS: *const Class = ptr::null();
 static mut PANEL_CLASS: *const Class = ptr::null();
 static mut VIEW_CLASS: *const Class = ptr::null();
 static mut OVERLAY_VIEW_CLASS: *const Class = ptr::null();
+static mut BACKDROP_VIEW_CLASS: *const Class = ptr::null();
 static mut BLURRED_VIEW_CLASS: *const Class = ptr::null();
 
 #[allow(non_upper_case_globals)]
@@ -353,6 +354,36 @@ unsafe fn build_classes() {
             }
             decl.register()
         };
+        BACKDROP_VIEW_CLASS = {
+            let mut decl = ClassDecl::new("GPUIBackdropView", class!(NSView)).unwrap();
+            decl.add_ivar::<f64>("blurRadius");
+            // Within-window NSVisualEffectView materials may use a cached view
+            // image, which cannot include a layer-hosted WebKit child. Sample
+            // the compositor's live layer tree directly instead.
+            extern "C" fn backing_layer(_: &Object, _: Sel) -> id {
+                unsafe {
+                    let layer: id = msg_send![class!(CABackdropLayer), layer];
+                    let _: () = msg_send![layer, setAllowsGroupBlending: YES];
+                    let _: () = msg_send![layer, setAllowsGroupOpacity: YES];
+                    let _: () = msg_send![layer, setIgnoresOffscreenGroups: YES];
+                    let _: () = msg_send![layer, setAllowsInPlaceFiltering: NO];
+                    let _: () = msg_send![layer, setScale: 0.25f64];
+                    layer
+                }
+            }
+            decl.add_method(
+                sel!(makeBackingLayer),
+                backing_layer as extern "C" fn(&Object, Sel) -> id,
+            );
+            extern "C" fn passthrough(_: &Object, _: Sel, _: NSPoint) -> id {
+                nil
+            }
+            decl.add_method(
+                sel!(hitTest:),
+                passthrough as extern "C" fn(&Object, Sel, NSPoint) -> id,
+            );
+            decl.register()
+        };
         BLURRED_VIEW_CLASS = {
             let mut decl = ClassDecl::new("BlurredView", class!(NSVisualEffectView)).unwrap();
             decl.add_method(
@@ -554,6 +585,7 @@ struct MacWindowState {
     renderer: renderer::Renderer,
     overlay_renderer: Option<renderer::Renderer>,
     overlay_view: Option<NonNull<Object>>,
+    overlay_backdrops: Vec<(NonNull<Object>, f32)>,
     overlay_capture_input: Arc<AtomicBool>,
     overlay_size: Option<(Size<Pixels>, f32)>,
     request_frame_callback: Option<Box<dyn FnMut(RequestFrameOptions)>>,
@@ -595,6 +627,15 @@ struct MacWindowState {
 }
 
 impl MacWindowState {
+    fn set_presents_with_transaction(&mut self, enabled: bool) {
+        // Native geometry and both Metal planes must land in the same frame.
+        let enabled = enabled || self.overlay_renderer.is_some();
+        self.renderer.set_presents_with_transaction(enabled);
+        if let Some(renderer) = self.overlay_renderer.as_mut() {
+            renderer.set_presents_with_transaction(enabled);
+        }
+    }
+
     fn move_traffic_light(&mut self) {
         if let Some(traffic_light_position) = self.traffic_light_position {
             if self.is_fullscreen() {
@@ -963,6 +1004,7 @@ impl MacWindow {
                 ),
                 overlay_renderer: None,
                 overlay_view: None,
+                overlay_backdrops: Vec::new(),
                 overlay_capture_input: Arc::new(AtomicBool::new(false)),
                 overlay_size: None,
                 request_frame_callback: None,
@@ -1928,6 +1970,70 @@ impl PlatformWindow for MacWindow {
             }
             state.overlay_size = Some((size, scale));
         }
+        // A Metal texture cannot sample pixels from a sibling WKWebView.
+        // AppKit's within-window effects include native content in the blur.
+        // Keep these effect views below GPUI text and above native children.
+        unsafe {
+            while state.overlay_backdrops.len() > overlay.backdrop_blurs.len() {
+                let view = state.overlay_backdrops.pop().unwrap().0.as_ptr();
+                let _: () = msg_send![view, removeFromSuperview];
+            }
+            let parent = state.native_view.as_ptr();
+            let plane = state.overlay_view.unwrap().as_ptr();
+            for (index, blur) in overlay.backdrop_blurs.iter().enumerate() {
+                let view = if let Some((view, _)) = state.overlay_backdrops.get(index) {
+                    view.as_ptr()
+                } else {
+                    let view: id = msg_send![BACKDROP_VIEW_CLASS, alloc];
+                    let view = NSView::initWithFrame_(
+                        view,
+                        NSRect::new(NSPoint::new(0., 0.), NSSize::new(0., 0.)),
+                    );
+                    view.setWantsLayer(YES);
+                    parent.addSubview_(view.autorelease());
+                    state
+                        .overlay_backdrops
+                        .push((NonNull::new(view).unwrap(), blur.blur_radius.0));
+                    view
+                };
+                let bounds = blur.bounds.intersect(&blur.content_mask.bounds);
+                let x = (bounds.origin.x.0 / scale) as f64;
+                let width = (bounds.size.width.0 / scale).max(0.) as f64;
+                let height = (bounds.size.height.0 / scale).max(0.) as f64;
+                let y = f32::from(size.height) as f64 - (bounds.origin.y.0 / scale) as f64 - height;
+                let frame = NSRect::new(NSPoint::new(x, y), NSSize::new(width, height));
+                let _: () = msg_send![view, setFrame: frame];
+                let peak = &mut state.overlay_backdrops[index].1;
+                *peak = peak.max(blur.blur_radius.0);
+                let native_radius = (blur.blur_radius.0 / scale) as f64;
+                let layer: id = msg_send![view, layer];
+                if *(*view).get_ivar::<f64>("blurRadius") != native_radius {
+                    (*view).set_ivar("blurRadius", native_radius);
+                    // Filters are copied into the render tree. Updating a
+                    // nested filter value alone does not invalidate that copy.
+                    let filter: id =
+                        msg_send![class!(CAFilter), filterWithType: ns_string("gaussianBlur")];
+                    let radius_value: id =
+                        msg_send![class!(NSNumber), numberWithDouble: native_radius];
+                    let yes: id = msg_send![class!(NSNumber), numberWithBool: YES];
+                    let _: () =
+                        msg_send![filter, setValue: radius_value forKey: ns_string("inputRadius")];
+                    let _: () =
+                        msg_send![filter, setValue: yes forKey: ns_string("inputNormalizeEdges")];
+                    let filters: id = msg_send![class!(NSArray), arrayWithObject: filter];
+                    let _: () = msg_send![layer, setFilters: filters];
+                }
+                let alpha = (blur.blur_radius.0 / peak.max(1.0)).clamp(0.0, 1.0) as f64;
+                let _: () = msg_send![view, setAlphaValue: alpha];
+                let layer: id = msg_send![view, layer];
+                let radius = (blur.corner_radii.top_left.0 / scale) as f64;
+                let _: () = msg_send![layer, setCornerRadius: radius];
+                let _: () = msg_send![layer, setMasksToBounds: YES];
+                let _: () = msg_send![parent, addSubview: view positioned: NSWindowOrderingMode::NSWindowBelow relativeTo: plane];
+            }
+        }
+        // Keep the Metal blur too: overlapping GPUI popovers still need to
+        // blur earlier overlay content, while native effects supply the page.
         state.renderer.draw(&base);
         if visible {
             state.overlay_renderer.as_mut().unwrap().draw(&overlay);
@@ -1945,6 +2051,9 @@ impl PlatformWindow for MacWindow {
         let window = state.native_window;
         let view = state.native_view.as_ptr();
         drop(state);
+        unsafe {
+            let _: () = msg_send![class!(CATransaction), flush];
+        }
         if focus_chrome {
             unsafe {
                 let _: BOOL = msg_send![window, makeFirstResponder: view];
@@ -1985,6 +2094,7 @@ impl PlatformWindow for MacWindow {
             state.overlay_view = NonNull::new(view);
             state.overlay_size = Some((size, scale));
             state.overlay_renderer = Some(renderer);
+            state.set_presents_with_transaction(true);
         }
         Ok(())
     }
@@ -2793,14 +2903,14 @@ extern "C" fn window_did_change_key_status(this: &Object, selector: Sel, _: id) 
 
         if lock.activated_least_once {
             if let Some(mut callback) = lock.request_frame_callback.take() {
-                lock.renderer.set_presents_with_transaction(true);
+                lock.set_presents_with_transaction(true);
                 lock.stop_display_link();
                 drop(lock);
                 callback(Default::default());
 
                 let mut lock = window_state.lock();
                 lock.request_frame_callback = Some(callback);
-                lock.renderer.set_presents_with_transaction(false);
+                lock.set_presents_with_transaction(false);
                 lock.start_display_link();
             }
         } else {
@@ -2907,14 +3017,14 @@ extern "C" fn display_layer(this: &Object, _: Sel, _: id) {
     let window_state = unsafe { get_window_state(this) };
     let mut lock = window_state.lock();
     if let Some(mut callback) = lock.request_frame_callback.take() {
-        lock.renderer.set_presents_with_transaction(true);
+        lock.set_presents_with_transaction(true);
         lock.stop_display_link();
         drop(lock);
         callback(Default::default());
 
         let mut lock = window_state.lock();
         lock.request_frame_callback = Some(callback);
-        lock.renderer.set_presents_with_transaction(false);
+        lock.set_presents_with_transaction(false);
         lock.start_display_link();
     }
 }
