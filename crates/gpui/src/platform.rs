@@ -844,6 +844,17 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn on_appearance_changed(&self, callback: Box<dyn FnMut()>);
     fn on_button_layout_changed(&self, _callback: Box<dyn FnMut()>) {}
     fn draw(&self, scene: &Scene);
+
+    /// Paint deferred content above native child surfaces when supported.
+    fn draw_layered(&self, scene: &Scene, _overlay_start: usize, _capture_input: bool) {
+        self.draw(scene);
+    }
+
+    /// Enable a transparent scene plane above native children, once per window.
+    fn enable_scene_overlay(&self) -> anyhow::Result<()> {
+        anyhow::bail!("Native scene overlays are unavailable on this platform")
+    }
+
     fn completed_frame(&self) {}
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas>;
     fn is_subpixel_rendering_supported(&self) -> bool;

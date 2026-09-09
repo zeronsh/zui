@@ -457,6 +457,13 @@ impl MetalRenderer {
             .unwrap_or(ptr::null_mut())
     }
 
+    /// A transparent renderer must resolve the same atlas IDs as the base scene.
+    pub(crate) fn new_overlay(&self) -> Self {
+        let mut renderer = Self::new(self.instance_buffer_pool.clone(), true);
+        renderer.sprite_atlas = self.sprite_atlas.clone();
+        renderer
+    }
+
     pub fn sprite_atlas(&self) -> &Arc<MetalAtlas> {
         &self.sprite_atlas
     }
