@@ -191,6 +191,9 @@ struct WgpuResources {
     backdrop_blur_params_buffer: wgpu::Buffer,
     backdrop_blur_sampler: wgpu::Sampler,
     backdrop_scratch: Option<BackdropScratch>,
+    // Some GL surfaces cannot be copied. Render into a copyable texture and
+    // blit the completed frame to those surfaces when a backdrop is present.
+    backdrop_frame: Option<(wgpu::Texture, wgpu::util::TextureBlitter)>,
 }
 
 impl WgpuResources {
@@ -200,6 +203,7 @@ impl WgpuResources {
         self.path_msaa_texture = None;
         self.path_msaa_view = None;
         self.backdrop_scratch = None;
+        self.backdrop_frame = None;
     }
 }
 
@@ -233,9 +237,9 @@ pub struct WgpuRenderer {
     /// Frames since the last scene containing a backdrop blur; scratch is
     /// released once this reaches `SCRATCH_RELEASE_AFTER_FRAMES`.
     blur_free_frames: u32,
-    /// Whether the surface was configured with `COPY_SRC`, enabling the
-    /// snapshot copy the backdrop blur needs. False on exotic compositors.
-    backdrop_blur_supported: bool,
+    /// Whether the surface itself can supply backdrop snapshots. Other
+    /// surfaces use a copyable intermediate framebuffer.
+    surface_supports_copy_src: bool,
     /// Byte stride between uniform slots in `backdrop_blur_params_buffer`
     /// (multiple of `min_uniform_buffer_offset_alignment`, >= 64).
     backdrop_slot_stride: u64,
@@ -411,8 +415,8 @@ impl WgpuRenderer {
             );
         }
 
-        // COPY_SRC lets the backdrop blur snapshot framebuffer regions;
-        // without it (rare compositor restrictions) blurs are skipped.
+        // Prefer direct framebuffer snapshots where the surface supports them.
+        // GL and other restricted surfaces use a copyable intermediate frame.
         let surface_supports_copy_src = surface_caps.usages.contains(wgpu::TextureUsages::COPY_SRC);
         let surface_usage = if surface_supports_copy_src {
             wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC
@@ -581,6 +585,7 @@ impl WgpuRenderer {
             backdrop_blur_params_buffer,
             backdrop_blur_sampler,
             backdrop_scratch: None,
+            backdrop_frame: None,
         };
 
         Ok(Self {
@@ -607,7 +612,7 @@ impl WgpuRenderer {
             surface_configured: true,
             needs_redraw: false,
             blur_free_frames: 0,
-            backdrop_blur_supported: surface_supports_copy_src,
+            surface_supports_copy_src,
             backdrop_slot_stride,
         })
     }
@@ -1719,6 +1724,7 @@ impl WgpuRenderer {
             self.blur_free_frames = self.blur_free_frames.saturating_add(1);
             if self.blur_free_frames >= SCRATCH_RELEASE_AFTER_FRAMES {
                 self.resources_mut().backdrop_scratch = None;
+                self.resources_mut().backdrop_frame = None;
             }
         } else {
             self.blur_free_frames = 0;
@@ -1757,9 +1763,37 @@ impl WgpuRenderer {
         // Now that we know the surface is healthy, ensure intermediate textures exist
         self.ensure_intermediate_textures();
 
-        let frame_view = frame
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
+        let intermediate_frame =
+            !self.surface_supports_copy_src && !scene.backdrop_blurs.is_empty();
+        let frame_texture = if intermediate_frame {
+            let size = frame.texture.size();
+            let format = self.surface_config.format;
+            let resources = self.resources_mut();
+            if resources
+                .backdrop_frame
+                .as_ref()
+                .is_none_or(|(texture, _)| texture.size() != size)
+            {
+                let texture = resources.device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("copyable_backdrop_frame"),
+                    size,
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                        | wgpu::TextureUsages::COPY_SRC
+                        | wgpu::TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
+                });
+                let blitter = wgpu::util::TextureBlitter::new(&resources.device, format);
+                resources.backdrop_frame = Some((texture, blitter));
+            }
+            resources.backdrop_frame.as_ref().unwrap().0.clone()
+        } else {
+            frame.texture.clone()
+        };
+        let frame_view = frame_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
         let gamma_params = GammaParams {
             gamma_ratios: self.rendering_params.gamma_ratios,
@@ -1842,10 +1876,9 @@ impl WgpuRenderer {
                 let mut pending_blurs = scene.backdrop_blurs.iter().enumerate().peekable();
 
                 for batch in scene.batches() {
-                    while self.backdrop_blur_supported
-                        && pending_blurs
-                            .peek()
-                            .is_some_and(|(_, blur)| blur.order <= batch_first_order(scene, &batch))
+                    while pending_blurs
+                        .peek()
+                        .is_some_and(|(_, blur)| blur.order <= batch_first_order(scene, &batch))
                     {
                         let (blur_index, blur) = pending_blurs.next().unwrap();
                         if blur_index >= BACKDROP_MAX_BLURS {
@@ -1854,7 +1887,7 @@ impl WgpuRenderer {
                         drop(pass);
                         let blurred = self.process_backdrop_blur(
                             &mut encoder,
-                            &frame.texture,
+                            &frame_texture,
                             blur,
                             blur_index,
                         );
@@ -1965,6 +1998,18 @@ impl WgpuRenderer {
                 continue;
             }
 
+            if intermediate_frame {
+                let resources = self.resources();
+                let target = frame
+                    .texture
+                    .create_view(&wgpu::TextureViewDescriptor::default());
+                resources.backdrop_frame.as_ref().unwrap().1.copy(
+                    &resources.device,
+                    &mut encoder,
+                    &frame_view,
+                    &target,
+                );
+            }
             self.resources()
                 .queue
                 .submit(std::iter::once(encoder.finish()));
