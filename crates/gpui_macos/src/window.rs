@@ -356,6 +356,7 @@ unsafe fn build_classes() {
         };
         BACKDROP_VIEW_CLASS = {
             let mut decl = ClassDecl::new("GPUIBackdropView", class!(NSView)).unwrap();
+            decl.add_ivar::<f64>("blurRadius");
             // Within-window NSVisualEffectView materials may use a cached view
             // image, which cannot include a layer-hosted WebKit child. Sample
             // the compositor's live layer tree directly instead.
@@ -367,13 +368,6 @@ unsafe fn build_classes() {
                     let _: () = msg_send![layer, setIgnoresOffscreenGroups: YES];
                     let _: () = msg_send![layer, setAllowsInPlaceFiltering: NO];
                     let _: () = msg_send![layer, setScale: 0.25f64];
-                    let filter: id =
-                        msg_send![class!(CAFilter), filterWithType: ns_string("gaussianBlur")];
-                    let yes: id = msg_send![class!(NSNumber), numberWithBool: YES];
-                    let _: () =
-                        msg_send![filter, setValue: yes forKey: ns_string("inputNormalizeEdges")];
-                    let filters: id = msg_send![class!(NSArray), arrayWithObject: filter];
-                    let _: () = msg_send![layer, setFilters: filters];
                     layer
                 }
             }
@@ -634,6 +628,8 @@ struct MacWindowState {
 
 impl MacWindowState {
     fn set_presents_with_transaction(&mut self, enabled: bool) {
+        // Native geometry and both Metal planes must land in the same frame.
+        let enabled = enabled || self.overlay_renderer.is_some();
         self.renderer.set_presents_with_transaction(enabled);
         if let Some(renderer) = self.overlay_renderer.as_mut() {
             renderer.set_presents_with_transaction(enabled);
@@ -2011,8 +2007,22 @@ impl PlatformWindow for MacWindow {
                 *peak = peak.max(blur.blur_radius.0);
                 let native_radius = (blur.blur_radius.0 / scale) as f64;
                 let layer: id = msg_send![view, layer];
-                let radius_value: id = msg_send![class!(NSNumber), numberWithDouble: native_radius];
-                let _: () = msg_send![layer, setValue: radius_value forKeyPath: ns_string("filters.gaussianBlur.inputRadius")];
+                if *(*view).get_ivar::<f64>("blurRadius") != native_radius {
+                    (*view).set_ivar("blurRadius", native_radius);
+                    // Filters are copied into the render tree. Updating a
+                    // nested filter value alone does not invalidate that copy.
+                    let filter: id =
+                        msg_send![class!(CAFilter), filterWithType: ns_string("gaussianBlur")];
+                    let radius_value: id =
+                        msg_send![class!(NSNumber), numberWithDouble: native_radius];
+                    let yes: id = msg_send![class!(NSNumber), numberWithBool: YES];
+                    let _: () =
+                        msg_send![filter, setValue: radius_value forKey: ns_string("inputRadius")];
+                    let _: () =
+                        msg_send![filter, setValue: yes forKey: ns_string("inputNormalizeEdges")];
+                    let filters: id = msg_send![class!(NSArray), arrayWithObject: filter];
+                    let _: () = msg_send![layer, setFilters: filters];
+                }
                 let alpha = (blur.blur_radius.0 / peak.max(1.0)).clamp(0.0, 1.0) as f64;
                 let _: () = msg_send![view, setAlphaValue: alpha];
                 let layer: id = msg_send![view, layer];
@@ -2041,6 +2051,9 @@ impl PlatformWindow for MacWindow {
         let window = state.native_window;
         let view = state.native_view.as_ptr();
         drop(state);
+        unsafe {
+            let _: () = msg_send![class!(CATransaction), flush];
+        }
         if focus_chrome {
             unsafe {
                 let _: BOOL = msg_send![window, makeFirstResponder: view];
@@ -2081,6 +2094,7 @@ impl PlatformWindow for MacWindow {
             state.overlay_view = NonNull::new(view);
             state.overlay_size = Some((size, scale));
             state.overlay_renderer = Some(renderer);
+            state.set_presents_with_transaction(true);
         }
         Ok(())
     }
