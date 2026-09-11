@@ -88,7 +88,11 @@ impl MainThreadMailbox {
         wasm_bindgen_futures::spawn_local(async move {
             let view = mailbox.signal_view();
             loop {
+                // Clear the wake flag before draining. A producer that races the
+                // drain either leaves the flag set for waitAsync's synchronous
+                // `not-equal` result, or notifies the pending async wait.
                 js_sys::Atomics::store(&view, 0, 0).expect("Atomics.store failed");
+                mailbox.drain(&window);
 
                 let result = match js_sys::Atomics::wait_async(&view, 0, 0) {
                     Ok(result) => result,
@@ -103,19 +107,17 @@ impl MainThreadMailbox {
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
 
-                if !is_async {
-                    log::error!("Atomics.waitAsync returned synchronously; waker loop exiting");
-                    break;
+                if is_async {
+                    let promise: js_sys::Promise =
+                        js_sys::Reflect::get(&result, &JsValue::from_str("value"))
+                            .expect("waitAsync result missing 'value'")
+                            .unchecked_into();
+
+                    let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
                 }
-
-                let promise: js_sys::Promise =
-                    js_sys::Reflect::get(&result, &JsValue::from_str("value"))
-                        .expect("waitAsync result missing 'value'")
-                        .unchecked_into();
-
-                let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
-
-                mailbox.drain(&window);
+                // A synchronous result is the specified `not-equal` outcome:
+                // work was posted between the store and waitAsync. Loop so it
+                // is drained instead of permanently disabling main-thread work.
             }
         });
     }
