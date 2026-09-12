@@ -45,6 +45,7 @@ pub(crate) struct WebWindowMutableState {
 pub(crate) struct WebWindowInner {
     pub(crate) browser_window: web_sys::Window,
     pub(crate) canvas: web_sys::HtmlCanvasElement,
+    sizing_element: web_sys::HtmlElement,
     pub(crate) input_element: web_sys::HtmlInputElement,
     pub(crate) has_device_pixel_support: bool,
     pub(crate) is_mac: bool,
@@ -58,6 +59,7 @@ pub(crate) struct WebWindowInner {
     pub(crate) is_composing: Cell<bool>,
     mql_handle: RefCell<Option<MqlHandle>>,
     pending_physical_size: Cell<Option<(u32, u32)>>,
+    resize_force_render: Cell<bool>,
 }
 
 pub struct WebWindow {
@@ -97,10 +99,10 @@ impl WebWindow {
 
         let style = canvas.style();
         style
-            .set_property("width", "100%")
+            .set_property("width", "0px")
             .map_err(|e| anyhow::anyhow!("Failed to set canvas width style: {e:?}"))?;
         style
-            .set_property("height", "100%")
+            .set_property("height", "0px")
             .map_err(|e| anyhow::anyhow!("Failed to set canvas height style: {e:?}"))?;
         style
             .set_property("display", "block")
@@ -115,8 +117,23 @@ impl WebWindow {
         let body = document
             .body()
             .ok_or_else(|| anyhow::anyhow!("No `body` found on document"))?;
-        body.append_child(&canvas)
+        // Observe a separate layout box. The displayed canvas keeps the last
+        // rendered size until draw() commits a frame at the new dimensions.
+        let sizing_element: web_sys::HtmlElement = document
+            .create_element("div")
+            .map_err(|e| anyhow::anyhow!("Failed to create canvas host: {e:?}"))?
+            .unchecked_into();
+        sizing_element
+            .style()
+            .set_css_text("position:relative;width:100%;height:100%;overflow:hidden");
+        canvas.style().set_property("position", "absolute").ok();
+        canvas.style().set_property("top", "0").ok();
+        canvas.style().set_property("left", "0").ok();
+        sizing_element
+            .append_child(&canvas)
             .map_err(|e| anyhow::anyhow!("Failed to append canvas to body: {e:?}"))?;
+        body.append_child(&sizing_element)
+            .map_err(|e| anyhow::anyhow!("Failed to append canvas host: {e:?}"))?;
 
         let input_element: web_sys::HtmlInputElement = document
             .create_element("input")
@@ -174,6 +191,7 @@ impl WebWindow {
         let inner = Rc::new(WebWindowInner {
             browser_window,
             canvas,
+            sizing_element,
             input_element,
             has_device_pixel_support,
             is_mac,
@@ -187,6 +205,7 @@ impl WebWindow {
             is_composing: Cell::new(false),
             mql_handle: RefCell::new(None),
             pending_physical_size: Cell::new(None),
+            resize_force_render: Cell::new(false),
         });
 
         let raf_closure = inner.create_raf_closure();
@@ -228,26 +247,14 @@ impl WebWindow {
             let dpr = inner.browser_window.device_pixel_ratio();
             let dpr_f32 = dpr as f32;
 
-            let (physical_width, physical_height, logical_width, logical_height) =
-                if inner.has_device_pixel_support {
-                    let size: web_sys::ResizeObserverSize = entry
-                        .device_pixel_content_box_size()
-                        .get(0)
-                        .unchecked_into();
-                    let pw = size.inline_size() as u32;
-                    let ph = size.block_size() as u32;
-                    let lw = pw as f64 / dpr;
-                    let lh = ph as f64 / dpr;
-                    (pw, ph, lw as f32, lh as f32)
-                } else {
-                    // Safari fallback: use contentRect (always CSS px).
-                    let rect = entry.content_rect();
-                    let lw = rect.width() as f32;
-                    let lh = rect.height() as f32;
-                    let pw = (lw as f64 * dpr).round() as u32;
-                    let ph = (lh as f64 * dpr).round() as u32;
-                    (pw, ph, lw, lh)
-                };
+            // Layout and pointer coordinates are CSS pixels. Do not derive
+            // them from the device-pixel box, which can use a different scale
+            // under browser emulation/zoom.
+            let rect = entry.content_rect();
+            let logical_width = rect.width() as f32;
+            let logical_height = rect.height() as f32;
+            let physical_width = (rect.width() * dpr).round() as u32;
+            let physical_height = (rect.height() * dpr).round() as u32;
 
             inner.apply_canvas_size(
                 physical_width,
@@ -293,6 +300,7 @@ impl WebWindowInner {
             physical_width.min(max_texture_dimension),
             physical_height.min(max_texture_dimension),
         )));
+        self.resize_force_render.set(true);
 
         let new_size = Size {
             width: px(logical_width),
@@ -341,17 +349,11 @@ impl WebWindowInner {
         )
         .unwrap_or(false);
         if native_keyboard_resize {
-            let style = self.canvas.style();
-            style.set_property("width", "100%").ok();
-            style.set_property("height", "100%").ok();
             return;
         }
         let logical_width = viewport.width() as f32;
         let logical_height = (viewport.height() + viewport.offset_top()) as f32;
-        let style = self.canvas.style();
-        style.remove_property("position").ok();
-        style.remove_property("top").ok();
-        style.remove_property("left").ok();
+        let style = self.sizing_element.style();
         style
             .set_property("width", &format!("{logical_width}px"))
             .ok();
@@ -378,9 +380,10 @@ impl WebWindowInner {
             {
                 let mut callbacks = this.callbacks.borrow_mut();
                 if let Some(ref mut callback) = callbacks.request_frame {
+                    let force_render = this.resize_force_render.replace(false);
                     callback(RequestFrameOptions {
                         require_presentation: true,
-                        force_render: false,
+                        force_render,
                     });
                 }
             }
@@ -405,13 +408,13 @@ impl WebWindowInner {
     }
 
     fn observe_canvas(&self, observer: &web_sys::ResizeObserver) {
-        observer.unobserve(&self.canvas);
+        observer.unobserve(&self.sizing_element);
         if self.has_device_pixel_support {
             let options = web_sys::ResizeObserverOptions::new();
             options.set_box(web_sys::ResizeObserverBoxOptions::DevicePixelContentBox);
-            observer.observe_with_options(&self.canvas, &options);
+            observer.observe_with_options(&self.sizing_element, &options);
         } else {
-            observer.observe(&self.canvas);
+            observer.observe(&self.sizing_element);
         }
     }
 
@@ -607,7 +610,7 @@ impl PlatformWindow for WebWindow {
     }
 
     fn resize(&mut self, size: Size<Pixels>) {
-        let style = self.inner.canvas.style();
+        let style = self.inner.sizing_element.style();
         style
             .set_property("width", &format!("{}px", f32::from(size.width)))
             .ok();
@@ -750,6 +753,7 @@ impl PlatformWindow for WebWindow {
     }
 
     fn draw(&self, scene: &Scene) {
+        let resized = self.inner.pending_physical_size.get().is_some();
         if let Some((width, height)) = self.inner.pending_physical_size.take() {
             if self.inner.canvas.width() != width || self.inner.canvas.height() != height {
                 self.inner.canvas.set_width(width);
@@ -765,6 +769,16 @@ impl PlatformWindow for WebWindow {
         }
 
         self.inner.state.borrow_mut().renderer.draw(scene);
+        if resized {
+            let size = self.inner.state.borrow().bounds.size;
+            let style = self.inner.canvas.style();
+            style
+                .set_property("width", &format!("{}px", f32::from(size.width)))
+                .ok();
+            style
+                .set_property("height", &format!("{}px", f32::from(size.height)))
+                .ok();
+        }
     }
 
     fn completed_frame(&self) {
