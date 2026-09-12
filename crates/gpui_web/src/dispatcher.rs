@@ -102,17 +102,7 @@ impl MainThreadMailbox {
                     }
                 };
 
-                let is_async = js_sys::Reflect::get(&result, &JsValue::from_str("async"))
-                    .ok()
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-
-                if is_async {
-                    let promise: js_sys::Promise =
-                        js_sys::Reflect::get(&result, &JsValue::from_str("value"))
-                            .expect("waitAsync result missing 'value'")
-                            .unchecked_into();
-
+                if let Some(promise) = wait_async_promise(&result) {
                     let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
                 }
                 // A synchronous result is the specified `not-equal` outcome:
@@ -121,6 +111,22 @@ impl MainThreadMailbox {
             }
         });
     }
+}
+
+fn wait_async_promise(result: &JsValue) -> Option<js_sys::Promise> {
+    let is_async = js_sys::Reflect::get(result, &JsValue::from_str("async"))
+        .ok()
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    if !is_async {
+        return None;
+    }
+
+    Some(
+        js_sys::Reflect::get(result, &JsValue::from_str("value"))
+            .expect("waitAsync result missing 'value'")
+            .unchecked_into(),
+    )
 }
 
 pub struct WebDispatcher {
@@ -316,5 +322,28 @@ fn schedule_runnable(window: &web_sys::Window, runnable: RunnableVariant, priori
                 .set_timeout_with_callback_and_timeout_and_arguments_0(callback, 0)
                 .ok();
         }
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    #[wasm_bindgen_test]
+    fn synchronous_wait_result_does_not_supply_a_promise() {
+        let result = js_sys::Object::new();
+        js_sys::Reflect::set(&result, &JsValue::from_str("async"), &false.into()).unwrap();
+
+        assert!(wait_async_promise(&result).is_none());
+    }
+
+    #[wasm_bindgen_test]
+    fn asynchronous_wait_result_supplies_its_promise() {
+        let result = js_sys::Object::new();
+        let promise = js_sys::Promise::resolve(&JsValue::UNDEFINED);
+        js_sys::Reflect::set(&result, &JsValue::from_str("async"), &true.into()).unwrap();
+        js_sys::Reflect::set(&result, &JsValue::from_str("value"), &promise).unwrap();
+
+        assert!(wait_async_promise(&result).is_some());
     }
 }

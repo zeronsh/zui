@@ -16,6 +16,9 @@ multithreaded = ["dep:wasm_thread"]
 [lib]
 path = "src/gpui_web.rs"
 
+[dependencies]
+unicode-segmentation.workspace = true
+
 [target.'cfg(target_family = "wasm")'.dependencies]
 gpui.workspace = true
 parking_lot = { workspace = true, features = ["nightly"] }
@@ -73,3 +76,7 @@ web-sys = { version = "0.3", features = [
     "WheelEvent",
     "Window",
 ] }
+
+
+[target.'cfg(target_family = "wasm")'.dev-dependencies]
+wasm-bindgen-test = "=0.3.70"

@@ -1,0 +1,62 @@
+name: Web runtime
+
+on:
+  pull_request:
+    paths:
+      - ".cargo/**"
+      - ".github/workflows/web-runtime.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "crates/gpui/**"
+      - "crates/gpui_macros/**"
+      - "crates/gpui_platform/**"
+      - "crates/gpui_wgpu/**"
+      - "crates/gpui_web/**"
+      - "crates/http_client/**"
+  push:
+    paths:
+      - ".cargo/**"
+      - ".github/workflows/web-runtime.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "crates/gpui/**"
+      - "crates/gpui_macros/**"
+      - "crates/gpui_platform/**"
+      - "crates/gpui_wgpu/**"
+      - "crates/gpui_web/**"
+      - "crates/http_client/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  web-runtime:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      RUSTUP_TOOLCHAIN: nightly-2026-09-08
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - uses: dtolnay/rust-toolchain@nightly-2026-09-08
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Native Unicode regressions
+        run: cargo test --locked -p gpui_web --test input_policy
+
+      - name: Install matching wasm-bindgen test runner
+        run: cargo install wasm-bindgen-cli --version 0.2.120 --locked
+
+      - name: WASM runtime regressions
+        env:
+          CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER: wasm-bindgen-test-runner
+        run: cargo test --locked -p gpui_web --target wasm32-unknown-unknown --lib -- --nocapture
+
+      - name: Production WASM check
+        run: cargo check --locked -p gpui_web --target wasm32-unknown-unknown

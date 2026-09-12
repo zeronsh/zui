@@ -1,14 +1,15 @@
-use std::rc::Rc;
+use std::{cell::Cell, ops::Range, rc::Rc};
 
 use gpui::{
-    point, px, Capslock, DispatchEventResult, ExternalPaths, FileDropEvent, KeyDownEvent,
-    KeyUpEvent, Keystroke, Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent,
-    MouseExitEvent, MouseMoveEvent, MouseUpEvent, NavigationDirection, Pixels, PlatformInput,
-    Point, ScrollDelta, ScrollWheelEvent, TouchPhase,
+    Capslock, DispatchEventResult, ExternalPaths, FileDropEvent, KeyDownEvent, KeyUpEvent,
+    Keystroke, Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseExitEvent,
+    MouseMoveEvent, MouseUpEvent, NavigationDirection, Pixels, PlatformInput, Point, ScrollDelta,
+    ScrollWheelEvent, TouchPhase, UTF16Selection, point, px,
 };
 use smallvec::smallvec;
 use wasm_bindgen::prelude::*;
 
+use crate::input_policy::{DeleteDirection, deletion_range};
 use crate::window::WebWindowInner;
 
 pub struct WebEventListeners {
@@ -21,6 +22,7 @@ pub(crate) struct ClickState {
     last_time: f64,
     current_count: usize,
     touch_position: Option<Point<Pixels>>,
+    touch_start_position: Option<Point<Pixels>>,
     touch_scrolling: bool,
 }
 
@@ -31,6 +33,7 @@ impl Default for ClickState {
             last_time: 0.0,
             current_count: 0,
             touch_position: None,
+            touch_start_position: None,
             touch_scrolling: false,
         }
     }
@@ -52,6 +55,83 @@ impl ClickState {
         self.last_time = time;
         self.current_count
     }
+}
+
+const TOUCH_SCROLL_THRESHOLD: f32 = 5.0;
+
+impl ClickState {
+    fn begin_touch(&mut self, position: Point<Pixels>) {
+        self.touch_position = Some(position);
+        self.touch_start_position = Some(position);
+        self.touch_scrolling = false;
+    }
+
+    fn move_touch(&mut self, position: Point<Pixels>) -> Option<(Point<Pixels>, TouchPhase)> {
+        let Some(last_position) = self.touch_position.replace(position) else {
+            return None;
+        };
+        let delta = point(position.x - last_position.x, position.y - last_position.y);
+        if delta == point(px(0.), px(0.)) {
+            return None;
+        }
+
+        if self.touch_scrolling {
+            return Some((delta, TouchPhase::Moved));
+        }
+
+        let Some(start_position) = self.touch_start_position else {
+            return None;
+        };
+        let distance = ((f32::from(position.x) - f32::from(start_position.x)).powi(2)
+            + (f32::from(position.y) - f32::from(start_position.y)).powi(2))
+        .sqrt();
+        if distance < TOUCH_SCROLL_THRESHOLD {
+            return None;
+        }
+
+        self.touch_scrolling = true;
+        Some((delta, TouchPhase::Started))
+    }
+
+    fn end_touch(&mut self) -> bool {
+        let touch_scrolling = self.touch_scrolling;
+        self.touch_position = None;
+        self.touch_start_position = None;
+        self.touch_scrolling = false;
+        touch_scrolling
+    }
+}
+
+fn take_active_pointer_id(active_pointer_id: &Cell<Option<i32>>, pointer_id: i32) -> bool {
+    if active_pointer_id.get() != Some(pointer_id) {
+        return false;
+    }
+    active_pointer_id.set(None);
+    true
+}
+
+fn deletion_range_for_handler(
+    handler: &mut gpui::PlatformInputHandler,
+    selection: &UTF16Selection,
+    direction: DeleteDirection,
+) -> Option<Range<usize>> {
+    if !selection.range.is_empty() {
+        return Some(selection.range.clone());
+    }
+
+    let requested_range = 0..handler.text_length_utf16().unwrap_or(usize::MAX);
+    let mut actual_range = None;
+    let text = handler.text_for_range(requested_range.clone(), &mut actual_range)?;
+    deletion_range(
+        &selection.range,
+        direction,
+        &text,
+        actual_range.unwrap_or(requested_range),
+    )
+}
+
+fn should_prevent_keydown_default(result: &DispatchEventResult) -> bool {
+    !result.propagate || result.default_prevented
 }
 
 impl WebWindowInner {
@@ -152,8 +232,7 @@ impl WebWindowInner {
             if event.pointer_type() == "touch" {
                 let position = pointer_position_in_element(&event);
                 let mut click_state = this.click_state.borrow_mut();
-                click_state.touch_position = Some(position);
-                click_state.touch_scrolling = false;
+                click_state.begin_touch(position);
                 return;
             }
 
@@ -197,9 +276,7 @@ impl WebWindowInner {
                 let position = pointer_position_in_element(&event);
                 let modifiers = modifiers_from_mouse_event(&event, this.is_mac);
                 let mut click_state = this.click_state.borrow_mut();
-                let touch_scrolling = click_state.touch_scrolling;
-                click_state.touch_position = None;
-                click_state.touch_scrolling = false;
+                let touch_scrolling = click_state.end_touch();
 
                 this.active_pointer_id.set(None);
                 this.canvas.release_pointer_capture(event.pointer_id()).ok();
@@ -260,16 +337,14 @@ impl WebWindowInner {
         let this = Rc::clone(self);
         self.listen("pointercancel", move |event: JsValue| {
             let event: web_sys::PointerEvent = event.unchecked_into();
-            if this.active_pointer_id.replace(None) != Some(event.pointer_id()) {
+            if !take_active_pointer_id(&this.active_pointer_id, event.pointer_id()) {
                 return;
             }
             if event.pointer_type() == "touch" {
                 let position = pointer_position_in_element(&event);
                 let modifiers = modifiers_from_mouse_event(&event, this.is_mac);
                 let mut click_state = this.click_state.borrow_mut();
-                let touch_scrolling = click_state.touch_scrolling;
-                click_state.touch_position = None;
-                click_state.touch_scrolling = false;
+                let touch_scrolling = click_state.end_touch();
                 if touch_scrolling {
                     this.dispatch_input(PlatformInput::ScrollWheel(ScrollWheelEvent {
                         position,
@@ -294,16 +369,14 @@ impl WebWindowInner {
         let this = Rc::clone(self);
         self.listen("lostpointercapture", move |event: JsValue| {
             let event: web_sys::PointerEvent = event.unchecked_into();
-            if this.active_pointer_id.replace(None) != Some(event.pointer_id()) {
+            if !take_active_pointer_id(&this.active_pointer_id, event.pointer_id()) {
                 return;
             }
             if event.pointer_type() == "touch" {
                 let position = pointer_position_in_element(&event);
                 let modifiers = modifiers_from_mouse_event(&event, this.is_mac);
                 let mut click_state = this.click_state.borrow_mut();
-                let touch_scrolling = click_state.touch_scrolling;
-                click_state.touch_position = None;
-                click_state.touch_scrolling = false;
+                let touch_scrolling = click_state.end_touch();
                 if touch_scrolling {
                     this.dispatch_input(PlatformInput::ScrollWheel(ScrollWheelEvent {
                         position,
@@ -342,18 +415,8 @@ impl WebWindowInner {
                 let position = pointer_position_in_element(&event);
                 let modifiers = modifiers_from_mouse_event(&event, this.is_mac);
                 let mut click_state = this.click_state.borrow_mut();
-                let Some(last_position) = click_state.touch_position.replace(position) else {
+                let Some((delta, touch_phase)) = click_state.move_touch(position) else {
                     return;
-                };
-                let delta = point(position.x - last_position.x, position.y - last_position.y);
-                if delta == point(px(0.), px(0.)) {
-                    return;
-                }
-                let touch_phase = if click_state.touch_scrolling {
-                    TouchPhase::Moved
-                } else {
-                    click_state.touch_scrolling = true;
-                    TouchPhase::Started
                 };
                 drop(click_state);
 
@@ -532,7 +595,7 @@ impl WebWindowInner {
             let keystroke = Keystroke {
                 modifiers,
                 key,
-                key_char: key_char.clone(),
+                key_char,
             };
 
             let result = this.dispatch_input(PlatformInput::KeyDown(KeyDownEvent {
@@ -542,7 +605,7 @@ impl WebWindowInner {
             }));
 
             if let Some(result) = result {
-                if !result.propagate {
+                if should_prevent_keydown_default(&result) {
                     event.prevent_default();
                     return;
                 }
@@ -567,6 +630,32 @@ impl WebWindowInner {
                 || event.is_composing()
                 || input_type == "insertCompositionText"
             {
+                return;
+            }
+
+            let deletion_direction = match input_type.as_str() {
+                "deleteContentBackward" => Some(DeleteDirection::Backward),
+                "deleteContentForward" => Some(DeleteDirection::Forward),
+                _ => None,
+            };
+            if let Some(direction) = deletion_direction {
+                let handled = this
+                    .with_input_handler(|handler| {
+                        let Some(selection) = handler.selected_text_range(false) else {
+                            return false;
+                        };
+                        let Some(range) =
+                            deletion_range_for_handler(handler, &selection, direction)
+                        else {
+                            return false;
+                        };
+                        handler.replace_text_in_range(Some(range), "");
+                        true
+                    })
+                    .unwrap_or(false);
+                if handled {
+                    event.prevent_default();
+                }
                 return;
             }
 
@@ -907,4 +996,58 @@ fn extract_file_paths_from_drag(
         }
     }
     paths
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    #[wasm_bindgen_test]
+    fn unrelated_pointer_release_keeps_capture_owner() {
+        let active_pointer_id = Cell::new(Some(7));
+
+        assert!(!take_active_pointer_id(&active_pointer_id, 8));
+        assert_eq!(active_pointer_id.get(), Some(7));
+        assert!(take_active_pointer_id(&active_pointer_id, 7));
+        assert_eq!(active_pointer_id.get(), None);
+    }
+
+    #[wasm_bindgen_test]
+    fn touch_scroll_waits_for_movement_threshold() {
+        let mut state = ClickState::default();
+        state.begin_touch(point(px(10.), px(10.)));
+
+        assert_eq!(state.move_touch(point(px(13.), px(10.))), None);
+        assert!(!state.touch_scrolling);
+
+        let Some((delta, phase)) = state.move_touch(point(px(16.), px(10.))) else {
+            panic!("touch movement should start scrolling after leaving the slop region");
+        };
+        assert_eq!(delta, point(px(3.), px(0.)));
+        assert_eq!(phase, TouchPhase::Started);
+        assert!(state.touch_scrolling);
+
+        let Some((delta, phase)) = state.move_touch(point(px(18.), px(10.))) else {
+            panic!("subsequent touch movement should continue scrolling");
+        };
+        assert_eq!(delta, point(px(2.), px(0.)));
+        assert_eq!(phase, TouchPhase::Moved);
+    }
+
+    #[wasm_bindgen_test]
+    fn handled_keydown_prevents_browser_default() {
+        assert!(should_prevent_keydown_default(&DispatchEventResult {
+            propagate: false,
+            default_prevented: false,
+        }));
+        assert!(should_prevent_keydown_default(&DispatchEventResult {
+            propagate: true,
+            default_prevented: true,
+        }));
+        assert!(!should_prevent_keydown_default(&DispatchEventResult {
+            propagate: true,
+            default_prevented: false,
+        }));
+    }
 }
