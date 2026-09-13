@@ -5,6 +5,7 @@ on:
     paths:
       - ".cargo/**"
       - ".github/workflows/web-runtime.yml"
+      - "assets/fonts/**"
       - "Cargo.lock"
       - "Cargo.toml"
       - "crates/gpui/**"
@@ -17,6 +18,7 @@ on:
     paths:
       - ".cargo/**"
       - ".github/workflows/web-runtime.yml"
+      - "assets/fonts/**"
       - "Cargo.lock"
       - "Cargo.toml"
       - "crates/gpui/**"
@@ -48,8 +50,17 @@ jobs:
           toolchain: nightly-2026-09-08
           targets: wasm32-unknown-unknown
 
-      - name: Native Unicode regressions
-        run: cargo test --locked -p gpui_web --test input_policy
+      - name: Native font test dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends pkg-config libfontconfig1-dev libfreetype-dev
+
+
+      - name: Native input and touch-focus regressions
+        run: |
+          cargo test --locked -p gpui_web --test input_policy --test touch_keyboard
+          cargo test --locked -p gpui --lib touch_focus
+          cargo test --locked -p gpui_wgpu browser_bundle_renders_text_and_color_emoji_sequences
 
       - name: Install matching wasm-bindgen test runner
         run: cargo install wasm-bindgen-cli --version 0.2.120 --locked
@@ -58,6 +69,15 @@ jobs:
         env:
           CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER: wasm-bindgen-test-runner
         run: cargo test --locked -p gpui_web --target wasm32-unknown-unknown --lib -- --nocapture
+
+      - uses: browser-actions/setup-firefox@v1
+
+      - uses: browser-actions/setup-geckodriver@fac5b0424c584257f32cf12c5eb4ba86014c34f8
+
+      - name: Browser DOM touch-focus regression
+        env:
+          CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER: wasm-bindgen-test-runner
+        run: cargo test --locked -p gpui_web --target wasm32-unknown-unknown --test touch_keyboard_dom -- --nocapture
 
       - name: Production WASM check
         run: cargo check --locked -p gpui_web --target wasm32-unknown-unknown
