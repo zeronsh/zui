@@ -45,6 +45,7 @@ pub(crate) struct WebWindowMutableState {
 pub(crate) struct WebWindowInner {
     pub(crate) browser_window: web_sys::Window,
     pub(crate) canvas: web_sys::HtmlCanvasElement,
+    sizing_element: web_sys::HtmlElement,
     pub(crate) input_element: web_sys::HtmlInputElement,
     pub(crate) has_device_pixel_support: bool,
     pub(crate) is_mac: bool,
@@ -52,11 +53,13 @@ pub(crate) struct WebWindowInner {
     pub(crate) callbacks: RefCell<WebWindowCallbacks>,
     pub(crate) click_state: RefCell<ClickState>,
     pub(crate) pressed_button: Cell<Option<MouseButton>>,
+    pub(crate) active_pointer_id: Cell<Option<i32>>,
     pub(crate) last_physical_size: Cell<(u32, u32)>,
     pub(crate) notify_scale: Cell<bool>,
     pub(crate) is_composing: Cell<bool>,
     mql_handle: RefCell<Option<MqlHandle>>,
     pending_physical_size: Cell<Option<(u32, u32)>>,
+    resize_force_render: Cell<bool>,
 }
 
 pub struct WebWindow {
@@ -67,6 +70,7 @@ pub struct WebWindow {
     _raf_closure: Closure<dyn FnMut()>,
     _resize_observer: Option<web_sys::ResizeObserver>,
     _resize_observer_closure: Closure<dyn FnMut(js_sys::Array)>,
+    _visual_viewport_listener: Option<VisualViewportListener>,
     _event_listeners: WebEventListeners,
 }
 
@@ -95,10 +99,10 @@ impl WebWindow {
 
         let style = canvas.style();
         style
-            .set_property("width", "100%")
+            .set_property("width", "0px")
             .map_err(|e| anyhow::anyhow!("Failed to set canvas width style: {e:?}"))?;
         style
-            .set_property("height", "100%")
+            .set_property("height", "0px")
             .map_err(|e| anyhow::anyhow!("Failed to set canvas height style: {e:?}"))?;
         style
             .set_property("display", "block")
@@ -113,8 +117,23 @@ impl WebWindow {
         let body = document
             .body()
             .ok_or_else(|| anyhow::anyhow!("No `body` found on document"))?;
-        body.append_child(&canvas)
+        // Observe a separate layout box. The displayed canvas keeps the last
+        // rendered size until draw() commits a frame at the new dimensions.
+        let sizing_element: web_sys::HtmlElement = document
+            .create_element("div")
+            .map_err(|e| anyhow::anyhow!("Failed to create canvas host: {e:?}"))?
+            .unchecked_into();
+        sizing_element
+            .style()
+            .set_css_text("position:relative;width:100%;height:100%;overflow:hidden");
+        canvas.style().set_property("position", "absolute").ok();
+        canvas.style().set_property("top", "0").ok();
+        canvas.style().set_property("left", "0").ok();
+        sizing_element
+            .append_child(&canvas)
             .map_err(|e| anyhow::anyhow!("Failed to append canvas to body: {e:?}"))?;
+        body.append_child(&sizing_element)
+            .map_err(|e| anyhow::anyhow!("Failed to append canvas host: {e:?}"))?;
 
         let input_element: web_sys::HtmlInputElement = document
             .create_element("input")
@@ -172,6 +191,7 @@ impl WebWindow {
         let inner = Rc::new(WebWindowInner {
             browser_window,
             canvas,
+            sizing_element,
             input_element,
             has_device_pixel_support,
             is_mac,
@@ -179,11 +199,13 @@ impl WebWindow {
             callbacks: RefCell::new(WebWindowCallbacks::default()),
             click_state: RefCell::new(ClickState::default()),
             pressed_button: Cell::new(None),
+            active_pointer_id: Cell::new(None),
             last_physical_size: Cell::new((0, 0)),
             notify_scale: Cell::new(false),
             is_composing: Cell::new(false),
             mql_handle: RefCell::new(None),
             pending_physical_size: Cell::new(None),
+            resize_force_render: Cell::new(false),
         });
 
         let raf_closure = inner.create_raf_closure();
@@ -197,6 +219,7 @@ impl WebWindow {
             inner.observe_canvas(observer);
             inner.watch_dpr_changes(observer);
         }
+        let visual_viewport_listener = inner.watch_visual_viewport();
 
         let event_listeners = inner.register_event_listeners();
 
@@ -207,6 +230,7 @@ impl WebWindow {
             _raf_closure: raf_closure,
             _resize_observer: resize_observer,
             _resize_observer_closure: resize_observer_closure,
+            _visual_viewport_listener: visual_viewport_listener,
             _event_listeners: event_listeners,
         })
     }
@@ -223,83 +247,130 @@ impl WebWindow {
             let dpr = inner.browser_window.device_pixel_ratio();
             let dpr_f32 = dpr as f32;
 
-            let (physical_width, physical_height, logical_width, logical_height) =
-                if inner.has_device_pixel_support {
-                    let size: web_sys::ResizeObserverSize = entry
-                        .device_pixel_content_box_size()
-                        .get(0)
-                        .unchecked_into();
-                    let pw = size.inline_size() as u32;
-                    let ph = size.block_size() as u32;
-                    let lw = pw as f64 / dpr;
-                    let lh = ph as f64 / dpr;
-                    (pw, ph, lw as f32, lh as f32)
-                } else {
-                    // Safari fallback: use contentRect (always CSS px).
-                    let rect = entry.content_rect();
-                    let lw = rect.width() as f32;
-                    let lh = rect.height() as f32;
-                    let pw = (lw as f64 * dpr).round() as u32;
-                    let ph = (lh as f64 * dpr).round() as u32;
-                    (pw, ph, lw, lh)
-                };
+            // Layout and pointer coordinates are CSS pixels. Do not derive
+            // them from the device-pixel box, which can use a different scale
+            // under browser emulation/zoom.
+            let rect = entry.content_rect();
+            let logical_width = rect.width() as f32;
+            let logical_height = rect.height() as f32;
+            let physical_width = (rect.width() * dpr).round() as u32;
+            let physical_height = (rect.height() * dpr).round() as u32;
 
-            let scale_changed = inner.notify_scale.replace(false);
-            let prev = inner.last_physical_size.get();
-            let size_changed = prev != (physical_width, physical_height);
-
-            if !scale_changed && !size_changed {
-                return;
-            }
-            inner
-                .last_physical_size
-                .set((physical_width, physical_height));
-
-            // Skip rendering to a zero-size canvas (e.g. display:none).
-            if physical_width == 0 || physical_height == 0 {
-                let mut s = inner.state.borrow_mut();
-                s.bounds.size = Size::default();
-                s.scale_factor = dpr_f32;
-                // Still fire the callback so GPUI knows the window is gone.
-                drop(s);
-                let mut cbs = inner.callbacks.borrow_mut();
-                if let Some(ref mut callback) = cbs.resize {
-                    callback(Size::default(), dpr_f32);
-                }
-                return;
-            }
-
-            let max_texture_dimension = inner.state.borrow().max_texture_dimension;
-            let clamped_width = physical_width.min(max_texture_dimension);
-            let clamped_height = physical_height.min(max_texture_dimension);
-
-            inner
-                .pending_physical_size
-                .set(Some((clamped_width, clamped_height)));
-
-            {
-                let mut s = inner.state.borrow_mut();
-                s.bounds.size = Size {
-                    width: px(logical_width),
-                    height: px(logical_height),
-                };
-                s.scale_factor = dpr_f32;
-            }
-
-            let new_size = Size {
-                width: px(logical_width),
-                height: px(logical_height),
-            };
-
-            let mut cbs = inner.callbacks.borrow_mut();
-            if let Some(ref mut callback) = cbs.resize {
-                callback(new_size, dpr_f32);
-            }
+            inner.apply_canvas_size(
+                physical_width,
+                physical_height,
+                logical_width,
+                logical_height,
+                dpr_f32,
+            );
         })
     }
 }
 
 impl WebWindowInner {
+    fn apply_canvas_size(
+        &self,
+        physical_width: u32,
+        physical_height: u32,
+        logical_width: f32,
+        logical_height: f32,
+        scale_factor: f32,
+    ) {
+        let scale_changed = self.notify_scale.replace(false);
+        let size_changed = self.last_physical_size.get() != (physical_width, physical_height);
+        if !scale_changed && !size_changed {
+            return;
+        }
+        self.last_physical_size
+            .set((physical_width, physical_height));
+
+        if physical_width == 0 || physical_height == 0 {
+            let mut s = self.state.borrow_mut();
+            s.bounds.size = Size::default();
+            s.scale_factor = scale_factor;
+            drop(s);
+            if let Some(ref mut callback) = self.callbacks.borrow_mut().resize {
+                callback(Size::default(), scale_factor);
+            }
+            return;
+        }
+
+        let max_texture_dimension = self.state.borrow().max_texture_dimension;
+        self.pending_physical_size.set(Some((
+            physical_width.min(max_texture_dimension),
+            physical_height.min(max_texture_dimension),
+        )));
+        self.resize_force_render.set(true);
+
+        let new_size = Size {
+            width: px(logical_width),
+            height: px(logical_height),
+        };
+        {
+            let mut s = self.state.borrow_mut();
+            s.bounds.size = new_size;
+            s.scale_factor = scale_factor;
+        }
+        if let Some(ref mut callback) = self.callbacks.borrow_mut().resize {
+            callback(new_size, scale_factor);
+        }
+    }
+
+    fn watch_visual_viewport(self: &Rc<Self>) -> Option<VisualViewportListener> {
+        let viewport = self.browser_window.visual_viewport()?;
+        self.resize_canvas_to_visual_viewport(&viewport);
+
+        let this = Rc::clone(self);
+        let viewport_for_callback = viewport.clone();
+        let closure = Closure::<dyn FnMut(JsValue)>::new(move |_event: JsValue| {
+            this.resize_canvas_to_visual_viewport(&viewport_for_callback);
+        });
+
+        viewport
+            .add_event_listener_with_callback("resize", closure.as_ref().unchecked_ref())
+            .ok();
+        viewport
+            .add_event_listener_with_callback("scroll", closure.as_ref().unchecked_ref())
+            .ok();
+
+        Some(VisualViewportListener {
+            viewport,
+            _closure: closure,
+        })
+    }
+
+    fn resize_canvas_to_visual_viewport(&self, viewport: &web_sys::VisualViewport) {
+        // Chromium exposes VirtualKeyboard and honors resizes-content. Let the
+        // containing page size the canvas there; visualViewport can differ
+        // during keyboard/tool-bar transitions. Keep the fallback for WebKit.
+        let native_keyboard_resize = js_sys::Reflect::has(
+            self.browser_window.navigator().as_ref(),
+            &JsValue::from_str("virtualKeyboard"),
+        )
+        .unwrap_or(false);
+        if native_keyboard_resize {
+            return;
+        }
+        let logical_width = viewport.width() as f32;
+        let logical_height = (viewport.height() + viewport.offset_top()) as f32;
+        let style = self.sizing_element.style();
+        style
+            .set_property("width", &format!("{logical_width}px"))
+            .ok();
+        style
+            .set_property("height", &format!("{logical_height}px"))
+            .ok();
+
+        let dpr = self.browser_window.device_pixel_ratio() as f32;
+        self.apply_canvas_size(
+            (logical_width * dpr).round() as u32,
+            (logical_height * dpr).round() as u32,
+            logical_width,
+            logical_height,
+            dpr,
+        );
+    }
+
     fn create_raf_closure(self: &Rc<Self>) -> Closure<dyn FnMut()> {
         let raf_handle: Rc<RefCell<Option<js_sys::Function>>> = Rc::new(RefCell::new(None));
         let raf_handle_inner = Rc::clone(&raf_handle);
@@ -309,9 +380,10 @@ impl WebWindowInner {
             {
                 let mut callbacks = this.callbacks.borrow_mut();
                 if let Some(ref mut callback) = callbacks.request_frame {
+                    let force_render = this.resize_force_render.replace(false);
                     callback(RequestFrameOptions {
                         require_presentation: true,
-                        force_render: false,
+                        force_render,
                     });
                 }
             }
@@ -336,13 +408,13 @@ impl WebWindowInner {
     }
 
     fn observe_canvas(&self, observer: &web_sys::ResizeObserver) {
-        observer.unobserve(&self.canvas);
+        observer.unobserve(&self.sizing_element);
         if self.has_device_pixel_support {
             let options = web_sys::ResizeObserverOptions::new();
             options.set_box(web_sys::ResizeObserverBoxOptions::DevicePixelContentBox);
-            observer.observe_with_options(&self.canvas, &options);
+            observer.observe_with_options(&self.sizing_element, &options);
         } else {
-            observer.observe(&self.canvas);
+            observer.observe(&self.sizing_element);
         }
     }
 
@@ -461,6 +533,22 @@ struct MqlHandle {
     _closure: Closure<dyn FnMut(JsValue)>,
 }
 
+struct VisualViewportListener {
+    viewport: web_sys::VisualViewport,
+    _closure: Closure<dyn FnMut(JsValue)>,
+}
+
+impl Drop for VisualViewportListener {
+    fn drop(&mut self) {
+        self.viewport
+            .remove_event_listener_with_callback("resize", self._closure.as_ref().unchecked_ref())
+            .ok();
+        self.viewport
+            .remove_event_listener_with_callback("scroll", self._closure.as_ref().unchecked_ref())
+            .ok();
+    }
+}
+
 impl Drop for MqlHandle {
     fn drop(&mut self) {
         self.mql
@@ -522,7 +610,7 @@ impl PlatformWindow for WebWindow {
     }
 
     fn resize(&mut self, size: Size<Pixels>) {
-        let style = self.inner.canvas.style();
+        let style = self.inner.sizing_element.style();
         style
             .set_property("width", &format!("{}px", f32::from(size.width)))
             .ok();
@@ -665,6 +753,7 @@ impl PlatformWindow for WebWindow {
     }
 
     fn draw(&self, scene: &Scene) {
+        let resized = self.inner.pending_physical_size.get().is_some();
         if let Some((width, height)) = self.inner.pending_physical_size.take() {
             if self.inner.canvas.width() != width || self.inner.canvas.height() != height {
                 self.inner.canvas.set_width(width);
@@ -680,6 +769,16 @@ impl PlatformWindow for WebWindow {
         }
 
         self.inner.state.borrow_mut().renderer.draw(scene);
+        if resized {
+            let size = self.inner.state.borrow().bounds.size;
+            let style = self.inner.canvas.style();
+            style
+                .set_property("width", &format!("{}px", f32::from(size.width)))
+                .ok();
+            style
+                .set_property("height", &format!("{}px", f32::from(size.height)))
+                .ok();
+        }
     }
 
     fn completed_frame(&self) {
