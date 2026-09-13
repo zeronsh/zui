@@ -8,6 +8,29 @@ pub(crate) enum DeleteDirection {
     Forward,
 }
 
+/// Whether a completed touch tap requested an editable focus target.
+pub(crate) fn touch_requests_keyboard(down: Option<bool>, up: Option<bool>) -> bool {
+    // A release handler can override the press (e.g. closing a picker).
+    up.or(down).unwrap_or(false)
+}
+
+#[cfg(target_family = "wasm")]
+pub(crate) fn focus_after_touch(
+    input: &web_sys::HtmlInputElement,
+    canvas: &web_sys::HtmlCanvasElement,
+    down: Option<bool>,
+    up: Option<bool>,
+) {
+    if touch_requests_keyboard(down, up) {
+        input.focus().ok();
+    } else {
+        // A non-editable keyboard target dismisses the soft keyboard without
+        // preventing hardware keyboard shortcuts. Never defer this to a frame.
+        canvas.set_tab_index(-1);
+        canvas.focus().ok();
+    }
+}
+
 /// Computes a deletion range without splitting a Unicode grapheme cluster.
 ///
 /// `text_range_utf16` describes the UTF-16 document range represented by

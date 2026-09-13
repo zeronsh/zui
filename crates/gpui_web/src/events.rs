@@ -187,6 +187,14 @@ impl WebWindowInner {
         self.input_element
             .add_event_listener_with_callback(event_name, closure.as_ref().unchecked_ref())
             .ok();
+        // Touch click-away parks DOM focus on the non-editable canvas, so
+        // hardware keyboard shortcuts and window activation still work there.
+        if matches!(event_name, "keydown" | "keyup" | "focus" | "blur") {
+            self.canvas
+                .add_event_listener_with_callback(event_name, closure.as_ref().unchecked_ref())
+                .ok();
+        }
+
         closure
     }
 
@@ -289,21 +297,29 @@ impl WebWindowInner {
                         touch_phase: TouchPhase::Ended,
                     }));
                 } else {
-                    this.input_element.focus().ok();
                     let click_count = click_state.register_click(position, js_sys::Date::now());
-                    this.dispatch_input(PlatformInput::MouseDown(MouseDownEvent {
+                    drop(click_state);
+                    let down = this.dispatch_input(PlatformInput::MouseDown(MouseDownEvent {
                         button: MouseButton::Left,
                         position,
                         modifiers,
                         click_count,
                         first_mouse: false,
                     }));
-                    this.dispatch_input(PlatformInput::MouseUp(MouseUpEvent {
+                    let up = this.dispatch_input(PlatformInput::MouseUp(MouseUpEvent {
                         button: MouseButton::Left,
                         position,
                         modifiers,
                         click_count,
                     }));
+                    // Focus only after GPUI has identified this gesture's target,
+                    // but still in pointerup's trusted user-activation stack.
+                    crate::input_policy::focus_after_touch(
+                        &this.input_element,
+                        &this.canvas,
+                        down.and_then(|result| result.text_input_focus),
+                        up.and_then(|result| result.text_input_focus),
+                    );
                 }
                 return;
             }
@@ -639,9 +655,14 @@ impl WebWindowInner {
                 _ => None,
             };
             if let Some(direction) = deletion_direction {
-                let handled = this
+                let mut stream_input = false;
+                let mut handled = this
                     .with_input_handler(|handler| {
                         let Some(selection) = handler.selected_text_range(false) else {
+                            // PTYs accept text but have no editable document.
+                            // Route software-keyboard deletion through their
+                            // existing key handler, not through terminal output.
+                            stream_input = true;
                             return false;
                         };
                         let Some(range) =
@@ -653,6 +674,23 @@ impl WebWindowInner {
                         true
                     })
                     .unwrap_or(false);
+                if stream_input {
+                    let key = match direction {
+                        DeleteDirection::Backward => "backspace",
+                        DeleteDirection::Forward => "delete",
+                    };
+                    handled = this
+                        .dispatch_input(PlatformInput::KeyDown(KeyDownEvent {
+                            keystroke: Keystroke {
+                                key: key.into(),
+                                key_char: None,
+                                modifiers: Modifiers::default(),
+                            },
+                            is_held: false,
+                            prefer_character_input: false,
+                        }))
+                        .is_some_and(|result| should_prevent_keydown_default(&result));
+                }
                 if handled {
                     event.prevent_default();
                 }
@@ -793,7 +831,16 @@ impl WebWindowInner {
 
     fn register_blur(self: &Rc<Self>) -> Closure<dyn FnMut(JsValue)> {
         let this = Rc::clone(self);
-        self.listen_input("blur", move |_event: JsValue| {
+        self.listen_input("blur", move |event: JsValue| {
+            // Moving between the two DOM keyboard targets does not deactivate
+            // the GPUI window (in particular, do not steal a newly set focus).
+            if let Ok(target) = js_sys::Reflect::get(&event, &"relatedTarget".into()) {
+                let input: &JsValue = this.input_element.as_ref();
+                let canvas: &JsValue = this.canvas.as_ref();
+                if target == *input || target == *canvas {
+                    return;
+                }
+            }
             {
                 let mut state = this.state.borrow_mut();
                 state.is_active = false;
@@ -1040,14 +1087,17 @@ mod tests {
         assert!(should_prevent_keydown_default(&DispatchEventResult {
             propagate: false,
             default_prevented: false,
+            ..Default::default()
         }));
         assert!(should_prevent_keydown_default(&DispatchEventResult {
             propagate: true,
             default_prevented: true,
+            ..Default::default()
         }));
         assert!(!should_prevent_keydown_default(&DispatchEventResult {
             propagate: true,
             default_prevented: false,
+            ..Default::default()
         }));
     }
 }
