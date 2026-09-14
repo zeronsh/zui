@@ -1240,6 +1240,28 @@ SubpixelSpriteFragmentOutput subpixel_sprite_fragment(MonochromeSpriteFragmentIn
 **
 */
 
+struct ImageAlphaMaskParams {
+    Bounds bounds;
+    float radius;
+    float feather;
+    float clearance;
+    float bottom_y;
+    float bottom_feather;
+    float pad;
+};
+
+float image_mask_alpha(float2 position, ImageAlphaMaskParams mask) {
+    if (mask.feather <= 0.0) return 1.0;
+    float2 half_size = mask.bounds.size * 0.5;
+    float2 center = mask.bounds.origin + half_size;
+    float2 q = abs(position - center) - half_size + mask.radius;
+    float distance = length(max(q, float2(0.0, 0.0))) + min(max(q.x, q.y), 0.0) - mask.radius;
+    float alpha = smoothstep(0.0, mask.feather, distance - mask.clearance);
+    if (mask.bottom_feather > 0.0)
+        alpha = min(alpha, smoothstep(0.0, mask.bottom_feather, mask.bottom_y - position.y));
+    return alpha;
+}
+
 struct PolychromeSprite {
     uint order;
     uint pad;
@@ -1249,6 +1271,7 @@ struct PolychromeSprite {
     Bounds content_mask;
     Corners corner_radii;
     EdgeFadeParams fade;
+    ImageAlphaMaskParams alpha_mask;
     AtlasTile tile;
 };
 
@@ -1294,6 +1317,7 @@ float4 polychrome_sprite_fragment(PolychromeSpriteFragmentInput input): SV_Targe
         color = float4(grayscale, sample.a);
     }
     color.a *= sprite.opacity * saturate(0.5 - distance)
-        * edge_fade_alpha(input.position.xy, sprite.fade);
+        * edge_fade_alpha(input.position.xy, sprite.fade)
+        * image_mask_alpha(input.position.xy, sprite.alpha_mask);
     return color;
 }

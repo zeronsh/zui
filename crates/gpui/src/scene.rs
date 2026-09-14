@@ -820,7 +820,85 @@ pub struct PolychromeSprite {
     pub content_mask: ContentMask<ScaledPixels>,
     pub corner_radii: Corners<ScaledPixels>,
     pub fade: EdgeFadeParams,
+    pub alpha_mask: ImageAlphaMaskParams,
     pub tile: AtlasTile,
+}
+
+/// Smoothly exclude a rounded rectangle from an image without changing its
+/// texture. Coordinates are in window-space logical pixels, independent of UVs.
+#[derive(Clone, Copy, Debug)]
+pub struct ImageAlphaMask {
+    /// The rounded rectangle to exclude.
+    pub bounds: Bounds<crate::Pixels>,
+    /// Corner radius, clamped to half the shorter side.
+    pub radius: crate::Pixels,
+    /// Smoothstep distance outside the exclusion. Must be positive.
+    pub feather: crate::Pixels,
+    /// Extra transparent clearance outside the rounded rectangle.
+    pub clearance: crate::Pixels,
+    /// Optional bottom edge (window y) and smoothstep fade-band height.
+    pub bottom_fade: Option<(crate::Pixels, crate::Pixels)>,
+}
+
+/// GPU representation of [`ImageAlphaMask`], in device pixels. Zero feather
+/// disables the entire mask, preserving ordinary image painting exactly.
+#[derive(Default, Copy, Clone, Debug)]
+#[repr(C)]
+#[expect(missing_docs)]
+pub struct ImageAlphaMaskParams {
+    pub bounds: Bounds<ScaledPixels>,
+    pub radius: f32,
+    pub feather: f32,
+    pub clearance: f32,
+    pub bottom_y: f32,
+    pub bottom_feather: f32,
+    pub pad: f32,
+}
+
+impl ImageAlphaMask {
+    pub(crate) fn scale(self, factor: f32) -> ImageAlphaMaskParams {
+        let (bottom_y, bottom_feather) = self.bottom_fade.unwrap_or_default();
+        ImageAlphaMaskParams {
+            bounds: self.bounds.scale(factor),
+            radius: f32::from(self.radius)
+                .max(0.0)
+                .min(f32::from(self.bounds.size.width).max(0.0) * 0.5)
+                .min(f32::from(self.bounds.size.height).max(0.0) * 0.5)
+                * factor,
+            feather: f32::from(self.feather).max(0.0) * factor,
+            clearance: f32::from(self.clearance).max(0.0) * factor,
+            bottom_y: f32::from(bottom_y) * factor,
+            bottom_feather: f32::from(bottom_feather).max(0.0) * factor,
+            pad: 0.0,
+        }
+    }
+}
+
+#[cfg(test)]
+mod image_alpha_mask_tests {
+    use super::*;
+    use crate::{px, size};
+
+    #[test]
+    fn mask_scales_all_geometry_together_and_clamps_radius() {
+        let mask = ImageAlphaMask {
+            bounds: Bounds::new(point(px(40.25), px(300.5)), size(px(500.0), px(100.0))),
+            radius: px(80.0),
+            feather: px(220.0),
+            clearance: px(8.0),
+            bottom_fade: Some((px(480.0), px(96.8))),
+        };
+        for factor in [1.0, 1.25, 2.0] {
+            let scaled = mask.scale(factor);
+            assert_eq!(scaled.bounds, mask.bounds.scale(factor));
+            assert_eq!(scaled.radius, 50.0 * factor);
+            assert_eq!(scaled.feather, 220.0 * factor);
+            assert_eq!(scaled.clearance, 8.0 * factor);
+            assert_eq!(scaled.bottom_y, 480.0 * factor);
+            assert_eq!(scaled.bottom_feather, 96.8 * factor);
+        }
+        assert_eq!(ImageAlphaMaskParams::default().feather, 0.0);
+    }
 }
 
 impl From<PolychromeSprite> for Primitive {

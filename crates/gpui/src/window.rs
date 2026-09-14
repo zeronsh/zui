@@ -4435,6 +4435,7 @@ impl Window {
                 order: 0,
                 pad: 0,
                 grayscale: false.into(),
+                alpha_mask: Default::default(),
                 bounds,
                 corner_radii: Default::default(),
                 content_mask,
@@ -4542,6 +4543,30 @@ impl Window {
         frame_index: usize,
         grayscale: bool,
     ) -> Result<()> {
+        self.paint_image_fitted_masked(
+            visible,
+            fitted,
+            corner_radii,
+            data,
+            frame_index,
+            grayscale,
+            None,
+        )
+    }
+
+    /// Paint a fitted image with an optional window-space alpha exclusion.
+    /// Geometry changes reuse the existing atlas tile; no image rasterization
+    /// or texture upload is needed to move or resize the mask.
+    pub fn paint_image_fitted_masked(
+        &mut self,
+        visible: Bounds<Pixels>,
+        fitted: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        data: Arc<RenderImage>,
+        frame_index: usize,
+        grayscale: bool,
+        alpha_mask: Option<crate::ImageAlphaMask>,
+    ) -> Result<()> {
         self.invalidator.debug_assert_paint();
 
         let crop = (visible != fitted).then_some((visible, fitted));
@@ -4596,6 +4621,9 @@ impl Window {
             order: 0,
             pad: 0,
             grayscale: grayscale.into(),
+            alpha_mask: alpha_mask
+                .map(|mask| mask.scale(self.scale_factor()))
+                .unwrap_or_default(),
             bounds,
             content_mask,
             corner_radii,

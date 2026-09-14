@@ -2500,6 +2500,110 @@ mod backdrop_blur_tests {
     }
 
     #[test]
+    fn image_alpha_mask_matches_reference_and_reuses_texture_across_frames() {
+        use gpui::{ImageAlphaMaskParams, PlatformAtlas, RenderImage, RenderImageParams};
+        use std::borrow::Cow;
+        assert!(
+            metal::Device::system_default().is_some(),
+            "requires Metal GPU"
+        );
+        let mut renderer =
+            MetalRenderer::new_headless(Arc::new(Mutex::new(InstanceBufferPool::default())));
+        // BGRA source with partial alpha, so this also covers source-alpha and
+        // color preservation rather than only an opaque white texture.
+        let source = RenderImage::new([image::Frame::new(RgbaImage::from_pixel(
+            2,
+            2,
+            image::Rgba([79, 151, 233, 180]),
+        ))]);
+        let key = RenderImageParams {
+            image_id: source.id,
+            frame_index: 0,
+        }
+        .into();
+        let tile = renderer
+            .sprite_atlas()
+            .get_or_insert_with(&key, &mut || {
+                Ok(Some((
+                    source.size(0),
+                    Cow::Borrowed(source.as_bytes(0).unwrap()),
+                )))
+            })
+            .unwrap()
+            .unwrap();
+        let mut paint = |alpha_mask| {
+            let mut scene = Scene::default();
+            push_quad(&mut scene, viewport(), 0.0);
+            scene.insert_primitive(PolychromeSprite {
+                order: 0,
+                pad: 0,
+                grayscale: false.into(),
+                opacity: 0.75,
+                bounds: viewport(),
+                content_mask: ContentMask { bounds: viewport() },
+                corner_radii: Default::default(),
+                fade: Default::default(),
+                alpha_mask,
+                tile,
+            });
+            scene.finish();
+            assert_eq!(scene.polychrome_sprites.len(), 1);
+            let cached = renderer
+                .sprite_atlas()
+                .get_or_insert_with(&key, &mut || panic!("mask geometry reuploaded the image"))
+                .unwrap()
+                .unwrap();
+            assert_eq!(cached, tile);
+            renderer
+                .render_scene_to_image(&scene, size(DevicePixels(VIEW_W), DevicePixels(VIEW_H)))
+                .unwrap()
+        };
+        let baseline = paint(ImageAlphaMaskParams::default());
+        for (left, top, width, radius, feather) in [
+            (100.0, 360.0, 440.0, 26.0, 220.0),
+            (212.25, 352.5, 260.0, 26.0, 220.0),
+            (40.5, 300.25, 300.0, 13.0, 120.0),
+            (0.0, 420.0, 600.0, 52.0, 240.0),
+        ] {
+            let mask = ImageAlphaMaskParams {
+                bounds: bounds(left, top, width, 124.0),
+                radius,
+                feather,
+                clearance: 8.0,
+                bottom_y: 480.0,
+                bottom_feather: 96.8,
+                pad: 0.0,
+            };
+            let actual = paint(mask);
+            let smooth = |v: f32| {
+                let t = v.clamp(0.0, 1.0);
+                t * t * (3.0 - 2.0 * t)
+            };
+            for y in 0..VIEW_H as u32 {
+                for x in 0..VIEW_W as u32 {
+                    let qx = (x as f32 + 0.5 - left - width * 0.5).abs() - width * 0.5 + radius;
+                    let qy = (y as f32 + 0.5 - top - 62.0).abs() - 62.0 + radius;
+                    let distance = qx.max(0.0).hypot(qy.max(0.0)) + qx.max(qy).min(0.0) - radius;
+                    let alpha =
+                        smooth((distance - 8.0) / feather).min(smooth((479.5 - y as f32) / 96.8));
+                    for channel in 0..3 {
+                        let expected = baseline.get_pixel(x, y)[channel] as f32 * alpha;
+                        assert!(
+                            (actual.get_pixel(x, y)[channel] as f32 - expected).abs() <= 2.0,
+                            "GPU/reference mismatch at {x},{y} channel {channel}"
+                        );
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            paint(ImageAlphaMaskParams::default()),
+            baseline,
+            "disabling mask must restore ordinary image exactly"
+        );
+    }
+
+    #[test]
     fn blur_preserves_linear_gradient() {
         if metal::Device::system_default().is_none() {
             return;

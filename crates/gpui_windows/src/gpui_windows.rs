@@ -43,7 +43,7 @@ pub(crate) use windows::Win32::Foundation::HWND;
 
 #[cfg(test)]
 mod tests {
-    use gpui::{AtlasTile, EdgeFadeParams, PolychromeSprite, Quad};
+    use gpui::{AtlasTile, EdgeFadeParams, ImageAlphaMaskParams, PolychromeSprite, Quad};
     use std::mem::{align_of, offset_of, size_of};
 
     const SHADERS: &str = include_str!("shaders.hlsl");
@@ -113,9 +113,10 @@ mod tests {
     #[test]
     fn polychrome_hlsl_layout_keeps_fade_before_atlas_tile() {
         assert_eq!(offset_of!(PolychromeSprite, fade), 64);
-        assert_eq!(offset_of!(PolychromeSprite, tile), 96);
+        assert_eq!(offset_of!(PolychromeSprite, alpha_mask), 96);
+        assert_eq!(offset_of!(PolychromeSprite, tile), 136);
         assert_eq!(size_of::<AtlasTile>(), 32);
-        assert_eq!(size_of::<PolychromeSprite>(), 128);
+        assert_eq!(size_of::<PolychromeSprite>(), 168);
         assert_fields_in_order(
             hlsl_struct("PolychromeSprite"),
             &[
@@ -127,7 +128,27 @@ mod tests {
                 "Bounds content_mask;",
                 "Corners corner_radii;",
                 "EdgeFadeParams fade;",
+                "ImageAlphaMaskParams alpha_mask;",
                 "AtlasTile tile;",
+            ],
+        );
+    }
+
+    #[test]
+    fn image_alpha_mask_hlsl_layout_matches_host() {
+        assert_eq!(size_of::<ImageAlphaMaskParams>(), 40);
+        assert_eq!(offset_of!(ImageAlphaMaskParams, radius), 16);
+        assert_eq!(offset_of!(ImageAlphaMaskParams, bottom_feather), 32);
+        assert_fields_in_order(
+            hlsl_struct("ImageAlphaMaskParams"),
+            &[
+                "Bounds bounds;",
+                "float radius;",
+                "float feather;",
+                "float clearance;",
+                "float bottom_y;",
+                "float bottom_feather;",
+                "float pad;",
             ],
         );
     }
