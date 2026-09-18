@@ -834,6 +834,10 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     /// Stop idle frame callbacks until frame_requester is called again.
     fn pause_frame_requests(&self) {}
     fn on_input(&self, callback: Box<dyn FnMut(PlatformInput) -> DispatchEventResult>);
+
+    /// Reports a synchronous text-focus request made while dispatching input.
+    /// Platforms that do not need this signal can ignore it.
+    fn set_text_input_focus_request(&self, _request: Option<bool>) {}
     fn on_active_status_change(&self, callback: Box<dyn FnMut(bool)>);
     fn on_hover_status_change(&self, callback: Box<dyn FnMut(bool)>);
     fn on_resize(&self, callback: Box<dyn FnMut(Size<Pixels>, f32)>);

@@ -1,14 +1,16 @@
-use std::rc::Rc;
+use std::{cell::Cell, ops::Range, rc::Rc};
 
 use gpui::{
-    Capslock, DispatchEventResult, ExternalPaths, FileDropEvent, KeyDownEvent, KeyUpEvent,
-    Keystroke, Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseExitEvent,
-    MouseMoveEvent, MouseUpEvent, NavigationDirection, Pixels, PlatformInput, Point, ScrollDelta,
-    ScrollWheelEvent, TouchPhase, point, px,
+    Capslock, ClipboardEntry, ClipboardItem, DispatchEventResult, ExternalPaths, FileDropEvent,
+    Image, ImageFormat, KeyDownEvent, KeyUpEvent, Keystroke, Modifiers, ModifiersChangedEvent,
+    MouseButton, MouseDownEvent, MouseExitEvent, MouseMoveEvent, MouseUpEvent,
+    NavigationDirection, Pixels, PlatformInput, Point, ScrollDelta, ScrollWheelEvent,
+    TouchPhase, UTF16Selection, point, px,
 };
 use smallvec::smallvec;
 use wasm_bindgen::prelude::*;
 
+use crate::input_policy::{DeleteDirection, deletion_range};
 use crate::window::WebWindowInner;
 
 pub struct WebEventListeners {
@@ -20,6 +22,9 @@ pub(crate) struct ClickState {
     last_position: Point<Pixels>,
     last_time: f64,
     current_count: usize,
+    touch_position: Option<Point<Pixels>>,
+    touch_start_position: Option<Point<Pixels>>,
+    touch_scrolling: bool,
 }
 
 impl Default for ClickState {
@@ -28,6 +33,9 @@ impl Default for ClickState {
             last_position: Point::default(),
             last_time: 0.0,
             current_count: 0,
+            touch_position: None,
+            touch_start_position: None,
+            touch_scrolling: false,
         }
     }
 }
@@ -50,11 +58,102 @@ impl ClickState {
     }
 }
 
+const TOUCH_SCROLL_THRESHOLD: f32 = 5.0;
+
+impl ClickState {
+    fn begin_touch(&mut self, position: Point<Pixels>) {
+        self.touch_position = Some(position);
+        self.touch_start_position = Some(position);
+        self.touch_scrolling = false;
+    }
+
+    fn move_touch(&mut self, position: Point<Pixels>) -> Option<(Point<Pixels>, TouchPhase)> {
+        let last_position = self.touch_position.replace(position)?;
+        let delta = point(position.x - last_position.x, position.y - last_position.y);
+        if delta == point(px(0.), px(0.)) {
+            return None;
+        }
+
+        if self.touch_scrolling {
+            return Some((delta, TouchPhase::Moved));
+        }
+
+        let start_position = self.touch_start_position?;
+        let displacement = point(position.x - start_position.x, position.y - start_position.y);
+        let distance =
+            (f32::from(displacement.x).powi(2) + f32::from(displacement.y).powi(2)).sqrt();
+        if distance < TOUCH_SCROLL_THRESHOLD {
+            return None;
+        }
+
+        self.touch_scrolling = true;
+        Some((displacement, TouchPhase::Started))
+    }
+
+    fn end_touch(&mut self) -> bool {
+        let touch_scrolling = self.touch_scrolling;
+        self.touch_position = None;
+        self.touch_start_position = None;
+        self.touch_scrolling = false;
+        touch_scrolling
+    }
+}
+
+fn take_active_pointer_id(active_pointer_id: &Cell<Option<i32>>, pointer_id: i32) -> bool {
+    if active_pointer_id.get() != Some(pointer_id) {
+        return false;
+    }
+    active_pointer_id.set(None);
+    true
+}
+
+fn deletion_range_for_handler(
+    handler: &mut gpui::PlatformInputHandler,
+    selection: &UTF16Selection,
+    direction: DeleteDirection,
+) -> Option<Range<usize>> {
+    if !selection.range.is_empty() {
+        return Some(selection.range.clone());
+    }
+
+    let requested_range = 0..handler.text_length_utf16().unwrap_or(usize::MAX);
+    let mut actual_range = None;
+    let text = handler.text_for_range(requested_range.clone(), &mut actual_range)?;
+    deletion_range(
+        &selection.range,
+        direction,
+        &text,
+        actual_range.unwrap_or(requested_range),
+    )
+}
+
+fn should_prevent_keydown_default(result: &DispatchEventResult) -> bool {
+    !result.propagate || result.default_prevented
+}
+
+/// True for the platform's native paste chord (Ctrl+V, or Cmd+V on macOS)
+/// with no extra modifiers. `register_key_down` must not dispatch this as a
+/// GPUI action nor cancel its browser default: doing so consumes the
+/// keydown before the browser's native paste command can fire, so the
+/// `paste` DOM event (and the real clipboard payload it carries) never
+/// arrives. `register_paste` delivers fresh data for this shortcut instead,
+/// via a synthetic keydown fed straight into `dispatch_input`.
+fn is_native_paste_shortcut(key: &str, modifiers: &Modifiers, is_mac: bool) -> bool {
+    key == "v"
+        && modifiers.control == !is_mac
+        && modifiers.platform == is_mac
+        && !modifiers.alt
+        && !modifiers.shift
+        && !modifiers.function
+}
+
 impl WebWindowInner {
     pub fn register_event_listeners(self: &Rc<Self>) -> WebEventListeners {
         let mut closures = vec![
             self.register_pointer_down(),
             self.register_pointer_up(),
+            self.register_pointer_cancel(),
+            self.register_lost_pointer_capture(),
             self.register_pointer_move(),
             self.register_pointer_leave(),
             self.register_wheel(),
@@ -64,6 +163,7 @@ impl WebWindowInner {
             self.register_dragleave(),
             self.register_key_down(),
             self.register_key_up(),
+            self.register_before_input(),
             self.register_paste(),
             self.register_composition_start(),
             self.register_composition_update(),
@@ -100,6 +200,14 @@ impl WebWindowInner {
         self.input_element
             .add_event_listener_with_callback(event_name, closure.as_ref().unchecked_ref())
             .ok();
+        // Touch click-away parks DOM focus on the non-editable canvas, so
+        // hardware keyboard shortcuts and window activation still work there.
+        if matches!(event_name, "keydown" | "keyup" | "paste" | "focus" | "blur") {
+            self.canvas
+                .add_event_listener_with_callback(event_name, closure.as_ref().unchecked_ref())
+                .ok();
+        }
+
         closure
     }
 
@@ -135,6 +243,20 @@ impl WebWindowInner {
         self.listen("pointerdown", move |event: JsValue| {
             let event: web_sys::PointerEvent = event.unchecked_into();
             event.prevent_default();
+
+            if this.active_pointer_id.get().is_some() {
+                return;
+            }
+            this.canvas.set_pointer_capture(event.pointer_id()).ok();
+            this.active_pointer_id.set(Some(event.pointer_id()));
+
+            if event.pointer_type() == "touch" {
+                let position = pointer_position_in_element(&event);
+                let mut click_state = this.click_state.borrow_mut();
+                click_state.begin_touch(position);
+                return;
+            }
+
             this.input_element.focus().ok();
 
             let button = dom_mouse_button_to_gpui(event.button());
@@ -167,11 +289,68 @@ impl WebWindowInner {
             let event: web_sys::PointerEvent = event.unchecked_into();
             event.prevent_default();
 
+            if this.active_pointer_id.get() != Some(event.pointer_id()) {
+                return;
+            }
+
+            if event.pointer_type() == "touch" {
+                let position = pointer_position_in_element(&event);
+                let modifiers = modifiers_from_mouse_event(&event, this.is_mac);
+                let mut click_state = this.click_state.borrow_mut();
+                let touch_scrolling = click_state.end_touch();
+
+                this.active_pointer_id.set(None);
+                this.canvas.release_pointer_capture(event.pointer_id()).ok();
+
+                if touch_scrolling {
+                    this.dispatch_input(PlatformInput::ScrollWheel(ScrollWheelEvent {
+                        position,
+                        delta: ScrollDelta::Pixels(point(px(0.), px(0.))),
+                        modifiers,
+                        touch_phase: TouchPhase::Ended,
+                    }));
+                } else {
+                    let click_count = click_state.register_click(position, js_sys::Date::now());
+                    drop(click_state);
+                    // Focus only after GPUI has identified this gesture's target,
+                    // but still in pointerup's trusted user-activation stack.
+                    let down_focus = {
+                        this.dispatch_input(PlatformInput::MouseDown(MouseDownEvent {
+                            button: MouseButton::Left,
+                            position,
+                            modifiers,
+                            click_count,
+                            first_mouse: false,
+                        }));
+                        this.text_input_focus_request.take()
+                    };
+                    let up_focus = {
+                        this.dispatch_input(PlatformInput::MouseUp(MouseUpEvent {
+                            button: MouseButton::Left,
+                            position,
+                            modifiers,
+                            click_count,
+                        }));
+                        this.text_input_focus_request.take()
+                    };
+                    crate::input_policy::focus_after_touch(
+                        &this.input_element,
+                        &this.canvas,
+                        down_focus,
+                        up_focus,
+                    );
+                }
+                return;
+            }
+
             let button = dom_mouse_button_to_gpui(event.button());
             let position = pointer_position_in_element(&event);
             let modifiers = modifiers_from_mouse_event(&event, this.is_mac);
 
             this.pressed_button.set(None);
+            if this.active_pointer_id.replace(None) == Some(event.pointer_id()) {
+                this.canvas.release_pointer_capture(event.pointer_id()).ok();
+            }
             let click_count = this.click_state.borrow().current_count;
 
             {
@@ -189,11 +368,105 @@ impl WebWindowInner {
         })
     }
 
+    fn register_pointer_cancel(self: &Rc<Self>) -> Closure<dyn FnMut(JsValue)> {
+        let this = Rc::clone(self);
+        self.listen("pointercancel", move |event: JsValue| {
+            let event: web_sys::PointerEvent = event.unchecked_into();
+            if !take_active_pointer_id(&this.active_pointer_id, event.pointer_id()) {
+                return;
+            }
+            if event.pointer_type() == "touch" {
+                let position = pointer_position_in_element(&event);
+                let modifiers = modifiers_from_mouse_event(&event, this.is_mac);
+                let mut click_state = this.click_state.borrow_mut();
+                let touch_scrolling = click_state.end_touch();
+                if touch_scrolling {
+                    this.dispatch_input(PlatformInput::ScrollWheel(ScrollWheelEvent {
+                        position,
+                        delta: ScrollDelta::Pixels(point(px(0.), px(0.))),
+                        modifiers,
+                        touch_phase: TouchPhase::Cancelled,
+                    }));
+                }
+                return;
+            }
+            let Some(button) = this.pressed_button.take() else {
+                return;
+            };
+            this.dispatch_input(PlatformInput::MouseUp(MouseUpEvent {
+                button,
+                position: pointer_position_in_element(&event),
+                modifiers: modifiers_from_mouse_event(&event, this.is_mac),
+                click_count: this.click_state.borrow().current_count,
+            }));
+        })
+    }
+
+    fn register_lost_pointer_capture(self: &Rc<Self>) -> Closure<dyn FnMut(JsValue)> {
+        let this = Rc::clone(self);
+        self.listen("lostpointercapture", move |event: JsValue| {
+            let event: web_sys::PointerEvent = event.unchecked_into();
+            if !take_active_pointer_id(&this.active_pointer_id, event.pointer_id()) {
+                return;
+            }
+            if event.pointer_type() == "touch" {
+                let position = pointer_position_in_element(&event);
+                let modifiers = modifiers_from_mouse_event(&event, this.is_mac);
+                let mut click_state = this.click_state.borrow_mut();
+                let touch_scrolling = click_state.end_touch();
+                if touch_scrolling {
+                    this.dispatch_input(PlatformInput::ScrollWheel(ScrollWheelEvent {
+                        position,
+                        delta: ScrollDelta::Pixels(point(px(0.), px(0.))),
+                        modifiers,
+                        touch_phase: TouchPhase::Cancelled,
+                    }));
+                }
+                return;
+            }
+            let Some(button) = this.pressed_button.take() else {
+                return;
+            };
+            this.dispatch_input(PlatformInput::MouseUp(MouseUpEvent {
+                button,
+                position: pointer_position_in_element(&event),
+                modifiers: modifiers_from_mouse_event(&event, this.is_mac),
+                click_count: this.click_state.borrow().current_count,
+            }));
+        })
+    }
+
     fn register_pointer_move(self: &Rc<Self>) -> Closure<dyn FnMut(JsValue)> {
         let this = Rc::clone(self);
         self.listen("pointermove", move |event: JsValue| {
             let event: web_sys::PointerEvent = event.unchecked_into();
             event.prevent_default();
+
+            if this
+                .active_pointer_id
+                .get()
+                .is_some_and(|id| id != event.pointer_id())
+            {
+                return;
+            }
+
+            if event.pointer_type() == "touch" {
+                let position = pointer_position_in_element(&event);
+                let modifiers = modifiers_from_mouse_event(&event, this.is_mac);
+                let mut click_state = this.click_state.borrow_mut();
+                let Some((delta, touch_phase)) = click_state.move_touch(position) else {
+                    return;
+                };
+                drop(click_state);
+
+                this.dispatch_input(PlatformInput::ScrollWheel(ScrollWheelEvent {
+                    position,
+                    delta: ScrollDelta::Pixels(delta),
+                    modifiers,
+                    touch_phase,
+                }));
+                return;
+            }
 
             let position = pointer_position_in_element(&event);
             let modifiers = modifiers_from_mouse_event(&event, this.is_mac);
@@ -217,6 +490,9 @@ impl WebWindowInner {
         let this = Rc::clone(self);
         self.listen("pointerleave", move |event: JsValue| {
             let event: web_sys::PointerEvent = event.unchecked_into();
+            if event.pointer_type() == "touch" {
+                return;
+            }
 
             let position = pointer_position_in_element(&event);
             let modifiers = modifiers_from_mouse_event(&event, this.is_mac);
@@ -355,10 +631,17 @@ impl WebWindowInner {
             let is_held = event.repeat();
             let key_char = compute_key_char(&event, &key, &modifiers);
 
+            if is_native_paste_shortcut(&key, &modifiers, this.is_mac) {
+                // Let the browser's default paste command run so the `paste`
+                // DOM event fires with real clipboard contents; see
+                // `register_paste`/`dispatch_paste`.
+                return;
+            }
+
             let keystroke = Keystroke {
                 modifiers,
                 key,
-                key_char: key_char.clone(),
+                key_char,
             };
 
             let result = this.dispatch_input(PlatformInput::KeyDown(KeyDownEvent {
@@ -368,7 +651,7 @@ impl WebWindowInner {
             }));
 
             if let Some(result) = result {
-                if !result.propagate {
+                if should_prevent_keydown_default(&result) {
                     event.prevent_default();
                     return;
                 }
@@ -378,19 +661,86 @@ impl WebWindowInner {
                 event.prevent_default();
                 return;
             }
+        })
+    }
 
-            if modifiers.is_subset_of(&Modifiers::shift()) {
-                if let Some(text) = key_char {
-                    this.with_input_handler(|handler| {
-                        handler.replace_text_in_range(None, &text);
-                    });
-                    // The character went into the input handler; suppress browser
-                    // side-effects for the same keystroke (space scrolling the
-                    // page, quick-find, etc.). Everything not handled above falls
-                    // through so browser shortcuts keep their defaults.
+    /// Browser text commits arrive here, including software keyboards that do
+    /// not produce useful keydown character events. Keydown remains responsible
+    /// for commands and key bindings; this is the single path for inserted text.
+    fn register_before_input(self: &Rc<Self>) -> Closure<dyn FnMut(JsValue)> {
+        let this = Rc::clone(self);
+        self.listen_input("beforeinput", move |event: JsValue| {
+            let event: web_sys::InputEvent = event.unchecked_into();
+            let input_type = event.input_type();
+            if this.is_composing.get()
+                || event.is_composing()
+                || input_type == "insertCompositionText"
+            {
+                return;
+            }
+
+            let deletion_direction = match input_type.as_str() {
+                "deleteContentBackward" => Some(DeleteDirection::Backward),
+                "deleteContentForward" => Some(DeleteDirection::Forward),
+                _ => None,
+            };
+            if let Some(direction) = deletion_direction {
+                let mut stream_input = false;
+                let mut handled = this
+                    .with_input_handler(|handler| {
+                        let Some(selection) = handler.selected_text_range(false) else {
+                            // PTYs accept text but have no editable document.
+                            // Route software-keyboard deletion through their
+                            // existing key handler, not through terminal output.
+                            stream_input = true;
+                            return false;
+                        };
+                        let Some(range) =
+                            deletion_range_for_handler(handler, &selection, direction)
+                        else {
+                            return false;
+                        };
+                        handler.replace_text_in_range(Some(range), "");
+                        true
+                    })
+                    .unwrap_or(false);
+                if stream_input {
+                    let key = match direction {
+                        DeleteDirection::Backward => "backspace",
+                        DeleteDirection::Forward => "delete",
+                    };
+                    handled = this
+                        .dispatch_input(PlatformInput::KeyDown(KeyDownEvent {
+                            keystroke: Keystroke {
+                                key: key.into(),
+                                key_char: None,
+                                modifiers: Modifiers::default(),
+                            },
+                            is_held: false,
+                            prefer_character_input: false,
+                        }))
+                        .is_some_and(|result| should_prevent_keydown_default(&result));
+                }
+                if handled {
                     event.prevent_default();
                 }
+                return;
             }
+
+            let data = event.data();
+            let text = match input_type.as_str() {
+                "insertLineBreak" | "insertParagraph" => Some("\n"),
+                kind if kind.starts_with("insert") => data.as_deref(),
+                _ => None,
+            };
+            let Some(text) = text else {
+                return;
+            };
+
+            event.prevent_default();
+            this.with_input_handler(|handler| {
+                handler.replace_text_in_range(None, text);
+            });
         })
     }
 
@@ -436,11 +786,9 @@ impl WebWindowInner {
         })
     }
 
-    /// Paste is delivered through the DOM `paste` event rather than
-    /// `Platform::read_from_clipboard`: the browser's asynchronous clipboard
-    /// read API cannot fit that synchronous signature, while `ClipboardEvent`
-    /// exposes `clipboardData` synchronously inside the event. It fires for
-    /// any browser-initiated paste (keyboard, menu bar, context menu).
+    /// Bridge DOM paste data into GPUI's synchronous clipboard while dispatching
+    /// its normal paste key binding. This preserves app-specific paste handling
+    /// (notably image attachments) instead of bypassing it with raw text input.
     fn register_paste(self: &Rc<Self>) -> Closure<dyn FnMut(JsValue)> {
         let this = Rc::clone(self);
         self.listen_input("paste", move |event: JsValue| {
@@ -448,18 +796,62 @@ impl WebWindowInner {
             let Some(clipboard_data) = event.clipboard_data() else {
                 return;
             };
-            let Ok(text) = clipboard_data.get_data("text/plain") else {
-                return;
-            };
-            if text.is_empty() {
+            let text = clipboard_data.get_data("text/plain").unwrap_or_default();
+            let files = clipboard_data.files();
+            if text.is_empty() && files.as_ref().is_none_or(|files| files.length() == 0) {
                 return;
             }
-
             event.prevent_default();
-            this.with_input_handler(|handler| {
-                handler.replace_text_in_range(None, &text);
+            if files.as_ref().is_none_or(|files| files.length() == 0) {
+                this.with_input_handler(|handler| {
+                    handler.replace_text_in_range(None, &text);
+                });
+                return;
+            }
+            let this = Rc::clone(&this);
+            let file_count = files.as_ref().map_or(0, web_sys::FileList::length);
+            wasm_bindgen_futures::spawn_local(async move {
+                let mut entries = Vec::new();
+                for index in 0..file_count {
+                    let Some(file) = files.as_ref().and_then(|files| files.get(index)) else {
+                        continue;
+                    };
+                    let Some(format) = ImageFormat::from_mime_type(&file.type_()) else {
+                        continue;
+                    };
+                    let Ok(bytes) = wasm_bindgen_futures::JsFuture::from(file.array_buffer()).await else {
+                        continue;
+                    };
+                    entries.push(ClipboardEntry::Image(Image::from_bytes(
+                        format,
+                        js_sys::Uint8Array::new(&bytes).to_vec(),
+                    )));
+                }
+                if entries.is_empty() && !text.is_empty() {
+                    entries.push(ClipboardEntry::String(gpui::ClipboardString::new(text)));
+                }
+                if !entries.is_empty() {
+                    this.dispatch_paste(ClipboardItem { entries });
+                }
             });
         })
+    }
+
+    fn dispatch_paste(&self, item: ClipboardItem) {
+        *self.clipboard.borrow_mut() = Some(item);
+        self.dispatch_input(PlatformInput::KeyDown(KeyDownEvent {
+            keystroke: Keystroke {
+                key: "v".into(),
+                key_char: None,
+                modifiers: Modifiers {
+                    control: !self.is_mac,
+                    platform: self.is_mac,
+                    ..Modifiers::default()
+                },
+            },
+            is_held: false,
+            prefer_character_input: false,
+        }));
     }
 
     fn register_composition_start(self: &Rc<Self>) -> Closure<dyn FnMut(JsValue)> {
@@ -511,7 +903,16 @@ impl WebWindowInner {
 
     fn register_blur(self: &Rc<Self>) -> Closure<dyn FnMut(JsValue)> {
         let this = Rc::clone(self);
-        self.listen_input("blur", move |_event: JsValue| {
+        self.listen_input("blur", move |event: JsValue| {
+            // Moving between the two DOM keyboard targets does not deactivate
+            // the GPUI window (in particular, do not steal a newly set focus).
+            if let Ok(target) = js_sys::Reflect::get(&event, &"relatedTarget".into()) {
+                let input: &JsValue = this.input_element.as_ref();
+                let canvas: &JsValue = this.canvas.as_ref();
+                if target == *input || target == *canvas {
+                    return;
+                }
+            }
             {
                 let mut state = this.state.borrow_mut();
                 state.is_active = false;
@@ -714,4 +1115,61 @@ fn extract_file_paths_from_drag(
         }
     }
     paths
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    #[wasm_bindgen_test]
+    fn unrelated_pointer_release_keeps_capture_owner() {
+        let active_pointer_id = Cell::new(Some(7));
+
+        assert!(!take_active_pointer_id(&active_pointer_id, 8));
+        assert_eq!(active_pointer_id.get(), Some(7));
+        assert!(take_active_pointer_id(&active_pointer_id, 7));
+        assert_eq!(active_pointer_id.get(), None);
+    }
+
+    #[wasm_bindgen_test]
+    fn touch_scroll_waits_for_movement_threshold() {
+        let mut state = ClickState::default();
+        state.begin_touch(point(px(10.), px(10.)));
+
+        assert_eq!(state.move_touch(point(px(13.), px(10.))), None);
+        assert!(!state.touch_scrolling);
+
+        let Some((delta, phase)) = state.move_touch(point(px(16.), px(10.))) else {
+            panic!("touch movement should start scrolling after leaving the slop region");
+        };
+        assert_eq!(delta, point(px(6.), px(0.)));
+        assert_eq!(phase, TouchPhase::Started);
+        assert!(state.touch_scrolling);
+
+        let Some((delta, phase)) = state.move_touch(point(px(18.), px(10.))) else {
+            panic!("subsequent touch movement should continue scrolling");
+        };
+        assert_eq!(delta, point(px(2.), px(0.)));
+        assert_eq!(phase, TouchPhase::Moved);
+    }
+
+    #[wasm_bindgen_test]
+    fn handled_keydown_prevents_browser_default() {
+        assert!(should_prevent_keydown_default(&DispatchEventResult {
+            propagate: false,
+            default_prevented: false,
+            ..Default::default()
+        }));
+        assert!(should_prevent_keydown_default(&DispatchEventResult {
+            propagate: true,
+            default_prevented: true,
+            ..Default::default()
+        }));
+        assert!(!should_prevent_keydown_default(&DispatchEventResult {
+            propagate: true,
+            default_prevented: false,
+            ..Default::default()
+        }));
+    }
 }

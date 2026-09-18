@@ -37,6 +37,8 @@ pub(crate) struct TestWindowState {
     input_handler: Option<PlatformInputHandler>,
     is_fullscreen: bool,
     frame_requested: Rc<Cell<bool>>,
+
+    pub(crate) text_input_focus_request: Option<bool>,
     request_frame_callback: Option<Box<dyn FnMut(RequestFrameOptions)>>,
 }
 
@@ -91,6 +93,8 @@ impl TestWindow {
             input_handler: None,
             is_fullscreen: false,
             frame_requested: Rc::new(Cell::new(true)),
+
+            text_input_focus_request: None,
             request_frame_callback: None,
         })))
     }
@@ -142,6 +146,10 @@ impl TestWindow {
         let result = callback(event);
         self.0.lock().input_callback = Some(callback);
         !result.propagate
+    }
+
+    pub(crate) fn text_input_focus_request(&self) -> Option<bool> {
+        self.0.lock().text_input_focus_request
     }
 }
 
@@ -293,6 +301,10 @@ impl PlatformWindow for TestWindow {
 
     fn on_input(&self, callback: Box<dyn FnMut(crate::PlatformInput) -> DispatchEventResult>) {
         self.0.lock().input_callback = Some(callback)
+    }
+
+    fn set_text_input_focus_request(&self, request: Option<bool>) {
+        self.0.lock().text_input_focus_request = request;
     }
 
     fn on_active_status_change(&self, callback: Box<dyn FnMut(bool)>) {

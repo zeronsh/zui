@@ -347,6 +347,12 @@ impl Render for HelloWeb {
                     .text_color(rgb(TEXT_PRIMARY))
                     .child("Prime Sieve — GPUI Web"),
             )
+            .child(
+                div()
+                    .text_lg()
+                    .text_color(rgb(TEXT_PRIMARY))
+                    .child("Emoji: 😀 ❤️ 👍🏽 👩‍💻"),
+            )
             .child(div().text_sm().text_color(rgb(TEXT_DIM)).child(format!(
                 "Background threads: {} · Chunks per run: {}",
                 std::thread::available_parallelism().map_or(2, |n| n.get().max(2)),

@@ -4,6 +4,7 @@ mod dispatcher;
 mod display;
 mod events;
 mod http_client;
+mod input_policy;
 mod keyboard;
 mod logging;
 mod platform;
