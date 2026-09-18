@@ -97,6 +97,11 @@ impl TestWindow {
 
     /// Deliver one display tick if the window has requested frames.
     pub fn simulate_display_tick(&self) -> bool {
+        self.simulate_display_tick_with_options(RequestFrameOptions::default())
+    }
+
+    /// Deliver a requested display tick with the given platform timing options.
+    pub fn simulate_display_tick_with_options(&self, options: RequestFrameOptions) -> bool {
         let mut state = self.0.lock();
         if !state.frame_requested.get() {
             return false;
@@ -105,7 +110,7 @@ impl TestWindow {
             return false;
         };
         drop(state);
-        callback(RequestFrameOptions::default());
+        callback(options);
         self.0.lock().request_frame_callback = Some(callback);
         true
     }

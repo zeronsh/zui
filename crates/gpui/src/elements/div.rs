@@ -2386,7 +2386,9 @@ impl Interactivity {
                                                 window,
                                                 cx,
                                             );
-                                            self.paint_scroll_listener(hitbox, &style, window, cx);
+                                            self.paint_scroll_listener(
+                                                hitbox, bounds, &style, window, cx,
+                                            );
                                         }
 
                                         self.paint_keyboard_listeners(window, cx);
@@ -3080,6 +3082,7 @@ impl Interactivity {
     fn paint_scroll_listener(
         &self,
         hitbox: &Hitbox,
+        bounds: Bounds<Pixels>,
         style: &Style,
         window: &mut Window,
         _cx: &mut App,
@@ -3089,6 +3092,14 @@ impl Interactivity {
             let allow_concurrent_scroll = style.allow_concurrent_scroll;
             let restrict_scroll_to_axis = style.restrict_scroll_to_axis;
             let line_height = window.line_height();
+            let padding = style
+                .padding
+                .to_pixels(bounds.size.into(), window.rem_size());
+            let content_size = self.content_size
+                + size(padding.left + padding.right, padding.top + padding.bottom);
+            let scroll_max = Point::from(content_size - bounds.size)
+                .map(|value| (value * 100.).round() / 100.)
+                .max(&Point::default());
             let hitbox = hitbox.clone();
             let current_view = window.current_view();
             window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
@@ -3120,8 +3131,8 @@ impl Interactivity {
                             delta_x = Pixels::ZERO;
                         }
                     }
-                    scroll_offset.y += delta_y;
-                    scroll_offset.x += delta_x;
+                    scroll_offset.y = (scroll_offset.y + delta_y).clamp(-scroll_max.y, px(0.));
+                    scroll_offset.x = (scroll_offset.x + delta_x).clamp(-scroll_max.x, px(0.));
                     if *scroll_offset != old_scroll_offset {
                         cx.notify(current_view);
                     }
@@ -4120,6 +4131,49 @@ mod tests {
         TestAppContext, canvas, util::FluentBuilder as _,
     };
     use std::{cell::Cell, rc::Weak};
+
+    #[gpui::test]
+    fn scroll_clamps_each_sample_and_skips_edge_notifications(cx: &mut TestAppContext) {
+        struct ScrollView(ScrollHandle);
+        impl Render for ScrollView {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+                    .id("scroll")
+                    .size_full()
+                    .p(px(5.))
+                    .overflow_y_scroll()
+                    .track_scroll(&self.0)
+                    .child(div().h(px(400.)).w_full())
+            }
+        }
+        let cx = cx.add_empty_window();
+        let handle = ScrollHandle::new();
+        let view = cx.new(|_| ScrollView(handle.clone()));
+        cx.draw(Point::default(), size(px(100.), px(100.)), |_, _| {
+            view.clone().into_any_element()
+        });
+        let notifications = Rc::new(Cell::new(0));
+        let _subscription = cx.update(|_, cx| {
+            cx.observe(&view, {
+                let notifications = notifications.clone();
+                move |_, _| notifications.set(notifications.get() + 1)
+            })
+        });
+        let scroll = |dy| ScrollWheelEvent {
+            position: point(px(10.), px(10.)),
+            delta: crate::ScrollDelta::Pixels(point(px(0.), px(dy))),
+            ..Default::default()
+        };
+        for _ in 0..10 {
+            cx.simulate_event(scroll(10.));
+        }
+        assert_eq!(notifications.get(), 0);
+        cx.simulate_event(scroll(-1000.));
+        assert_eq!(handle.offset().y, px(-310.));
+        cx.simulate_event(scroll(0.25));
+        assert_eq!(handle.offset().y, px(-309.75));
+        assert_eq!(notifications.get(), 2);
+    }
 
     struct GroupHoverTestView {
         render_count: Rc<Cell<usize>>,

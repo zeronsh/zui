@@ -1583,12 +1583,14 @@ impl Window {
                         .log_err();
                 }
 
-                // Keep presenting if input was recently arriving at a high rate (>= 60fps).
-                // Once high-rate input is detected, we sustain presentation for 1 second
-                // to prevent display underclocking during active input.
+                // Sustain presentation after high-rate input only when the display
+                // may downclock. On fixed-rate displays, presenting an unchanged
+                // scene consumes GPU work and can block input on drawable acquisition.
                 let needs_present = request_frame_options.require_presentation
                     || needs_present.get()
-                    || (active.get() && input_rate_tracker.borrow_mut().is_high_rate());
+                    || (!request_frame_options.fixed_refresh_rate
+                        && active.get()
+                        && input_rate_tracker.borrow().is_high_rate());
 
                 if invalidator.is_dirty() || request_frame_options.force_render {
                     measure("frame duration", || {
@@ -1614,6 +1616,9 @@ impl Window {
                 handle
                     .update(&mut cx, |_, window, _| {
                         window.complete_frame();
+                        // Keep frame callbacks armed between high-rate input events,
+                        // even when duplicate presentation is disabled. Parking here
+                        // would repeatedly restart the source and trim GPU resources.
                         if !window.invalidator.is_dirty()
                             && !window.needs_present.get()
                             && window.next_frame_callbacks.borrow().is_empty()
@@ -6847,8 +6852,8 @@ pub fn outline(
 mod tests {
     use crate::{
         AppContext as _, Bounds, Context, FocusHandle, InteractiveElement as _, IntoElement,
-        ParentElement as _, Pixels, Render, Styled as _, TestAppContext, Window, canvas, div, px,
-        size,
+        ParentElement as _, Pixels, Render, RequestFrameOptions, Styled as _, TestAppContext,
+        Window, canvas, div, px, size,
     };
     use std::{cell::Cell, rc::Rc};
 
@@ -6996,6 +7001,99 @@ mod tests {
                 },
             )
             .size_full()
+        }
+    }
+
+    #[test]
+    fn high_rate_input_only_repeats_presentations_for_variable_refresh() {
+        for fixed_refresh_rate in [true, false] {
+            let mut cx = TestAppContext::single();
+            let desired = Rc::new(Cell::new(1));
+            let displayed = Rc::new(Cell::new(0));
+            let calls = Rc::new(Cell::new(0));
+            let handle = cx.add_window(|_, _| NativeFrameProbe {
+                desired: desired.clone(),
+                displayed: displayed.clone(),
+                calls: calls.clone(),
+            });
+            let platform = cx
+                .update_window(handle.into(), |_, window, _| {
+                    window.active.set(true);
+                    // Exercise the same high-rate detector as a burst of input,
+                    // without depending on a real display or wall-clock sleeps.
+                    for _ in 0..6 {
+                        window.input_rate_tracker.borrow_mut().record_input();
+                    }
+                    assert!(window.input_rate_tracker.borrow().is_high_rate());
+                    window.platform_window.as_test().unwrap().clone()
+                })
+                .unwrap();
+            let options = RequestFrameOptions {
+                fixed_refresh_rate,
+                ..Default::default()
+            };
+
+            assert!(platform.simulate_display_tick_with_options(options));
+            assert_eq!(displayed.get(), 1);
+            assert_eq!(calls.get(), 1);
+            for _ in 0..24 {
+                assert!(
+                    platform.simulate_display_tick_with_options(options),
+                    "the frame source must stay armed between high-rate events"
+                );
+            }
+            let repeated = if fixed_refresh_rate { 0 } else { 24 };
+            assert_eq!(calls.get(), 1 + repeated);
+
+            // A content update still reaches the next display tick.
+            handle
+                .update(&mut cx, |_, _, cx| {
+                    desired.set(2);
+                    cx.notify();
+                })
+                .unwrap();
+            assert!(platform.simulate_display_tick_with_options(options));
+            assert_eq!(displayed.get(), 2);
+            assert_eq!(calls.get(), 2 + repeated);
+
+            // Animation callbacks and explicit presentation requests are not
+            // subject to suppression of unchanged scenes.
+            handle
+                .update(&mut cx, |_, window, _| {
+                    let desired = desired.clone();
+                    window.on_next_frame(move |window, _| {
+                        desired.set(3);
+                        window.refresh();
+                    });
+                })
+                .unwrap();
+            assert!(platform.simulate_display_tick_with_options(options));
+            assert_eq!(displayed.get(), 3);
+            assert_eq!(calls.get(), 3 + repeated);
+            assert!(
+                platform.simulate_display_tick_with_options(RequestFrameOptions {
+                    require_presentation: true,
+                    ..options
+                })
+            );
+            assert_eq!(calls.get(), 4 + repeated);
+            assert!(
+                platform.simulate_display_tick_with_options(RequestFrameOptions {
+                    force_render: true,
+                    ..options
+                })
+            );
+            assert_eq!(calls.get(), 5 + repeated);
+
+            // Both modes must park once the high-rate input grace period ends.
+            handle
+                .update(&mut cx, |_, window, _| {
+                    window.input_rate_tracker.replace(Default::default());
+                })
+                .unwrap();
+            assert!(platform.simulate_display_tick_with_options(options));
+            assert_eq!(calls.get(), 5 + repeated);
+            assert!(!platform.simulate_display_tick_with_options(options));
         }
     }
 

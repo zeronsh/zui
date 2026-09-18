@@ -3,7 +3,7 @@ use crate::{
     Window, point, seal::Sealed,
 };
 use smallvec::SmallVec;
-use std::{any::Any, fmt::Debug, ops::Deref, path::PathBuf};
+use std::{any::Any, fmt::Debug, ops::Deref, path::PathBuf, time::Duration};
 
 /// An event from a platform input source.
 pub trait InputEvent: Sealed + 'static {
@@ -508,6 +508,23 @@ impl MouseMoveEvent {
     }
 }
 
+/// Native scroll lifecycle information. Unphased wheel events leave both fields
+/// unset. Momentum is supplied by the platform, not synthesized by GPUI.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ScrollGesture {
+    /// The phase while the user is touching the scrolling device.
+    pub touch_phase: Option<TouchPhase>,
+    /// The phase of the platform's inertial scrolling after release.
+    pub momentum_phase: Option<TouchPhase>,
+}
+
+impl ScrollGesture {
+    /// Whether the platform supplied a scroll lifecycle for this event.
+    pub fn is_phased(self) -> bool {
+        self.touch_phase.is_some() || self.momentum_phase.is_some()
+    }
+}
+
 /// A mouse wheel event from the platform.
 #[derive(Clone, Debug, Default)]
 pub struct ScrollWheelEvent {
@@ -522,6 +539,14 @@ pub struct ScrollWheelEvent {
 
     /// The phase of the touch event.
     pub touch_phase: TouchPhase,
+
+    /// Contact and momentum phases, when supplied by the platform. Use this
+    /// instead of `touch_phase` to distinguish inertial scrolling from contact.
+    pub gesture: ScrollGesture,
+
+    /// The native event time on the platform's monotonic clock. Its origin is
+    /// platform-specific; it must not be compared directly with `Instant`.
+    pub timestamp: Option<Duration>,
 }
 
 impl Sealed for ScrollWheelEvent {}
@@ -610,26 +635,12 @@ impl ScrollDelta {
     }
 
     /// Combines two scroll deltas into one.
-    /// If the signs of the deltas are the same (both positive or both negative),
-    /// the deltas are added together. If the signs are opposite, the second delta
-    /// (other) is used, effectively overriding the first delta.
+    /// Precise deltas are additive, including reversals and zero-delta lifecycle
+    /// events. Discrete wheel deltas retain the latest direction. This does not
+    /// replace applying individual events when clamping at scroll boundaries.
     pub fn coalesce(self, other: ScrollDelta) -> ScrollDelta {
         match (self, other) {
-            (ScrollDelta::Pixels(a), ScrollDelta::Pixels(b)) => {
-                let x = if a.x.signum() == b.x.signum() {
-                    a.x + b.x
-                } else {
-                    b.x
-                };
-
-                let y = if a.y.signum() == b.y.signum() {
-                    a.y + b.y
-                } else {
-                    b.y
-                };
-
-                ScrollDelta::Pixels(point(x, y))
-            }
+            (ScrollDelta::Pixels(a), ScrollDelta::Pixels(b)) => ScrollDelta::Pixels(a + b),
 
             (ScrollDelta::Lines(a), ScrollDelta::Lines(b)) => {
                 let x = if a.x.signum() == b.x.signum() {
@@ -805,6 +816,16 @@ impl PlatformInput {
 
 #[cfg(test)]
 mod test {
+
+    #[test]
+    fn precise_scroll_coalescing_preserves_reversals_and_zero_events() {
+        use crate::{ScrollDelta, point, px};
+        let first = ScrollDelta::Pixels(point(px(0.25), px(-12.5)));
+        let reversed = first.coalesce(ScrollDelta::Pixels(point(px(-0.1), px(2.25))));
+        assert_eq!(reversed.pixel_delta(px(20.)), point(px(0.15), px(-10.25)));
+        let ended = reversed.coalesce(ScrollDelta::Pixels(point(px(0.), px(0.))));
+        assert_eq!(ended.pixel_delta(px(20.)), reversed.pixel_delta(px(20.)));
+    }
 
     use crate::{
         self as gpui, AppContext as _, Context, FocusHandle, InteractiveElement, IntoElement,

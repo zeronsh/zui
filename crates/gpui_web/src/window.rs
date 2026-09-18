@@ -312,6 +312,7 @@ impl WebWindowInner {
                     callback(RequestFrameOptions {
                         require_presentation: true,
                         force_render: false,
+                        ..Default::default()
                     });
                 }
             }
