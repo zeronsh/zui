@@ -719,6 +719,10 @@ pub struct RequestFrameOptions {
     pub require_presentation: bool,
     /// Force refresh of all rendering states when true.
     pub force_render: bool,
+    /// The display is known to use a fixed refresh rate. Unchanged scenes need
+    /// not be presented to prevent variable-refresh-rate downclocking after
+    /// high-rate input. Defaults to false for platforms with unknown timing.
+    pub fixed_refresh_rate: bool,
 }
 
 /// The application's lifecycle phase, as owned and reported by a mobile OS.

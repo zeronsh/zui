@@ -2,7 +2,7 @@ use gpui::{
     Capslock, KeyDownEvent, KeyUpEvent, Keystroke, Modifiers, ModifiersChangedEvent, MouseButton,
     MouseDownEvent, MouseExitEvent, MouseMoveEvent, MousePressureEvent, MouseUpEvent,
     NavigationDirection, PinchEvent, Pixels, PlatformInput, PressureStage, ScrollDelta,
-    ScrollWheelEvent, TouchPhase, point, px,
+    ScrollGesture, ScrollWheelEvent, TouchPhase, point, px,
 };
 
 use crate::{
@@ -16,7 +16,58 @@ use cocoa::{
 use core_foundation::data::{CFDataGetBytePtr, CFDataRef};
 use core_graphics::event::CGKeyCode;
 use objc::{msg_send, sel, sel_impl};
-use std::{borrow::Cow, ffi::c_void};
+use std::{borrow::Cow, ffi::c_void, time::Duration};
+
+fn scroll_phase(phase: NSEventPhase) -> Option<TouchPhase> {
+    match phase {
+        NSEventPhase::NSEventPhaseMayBegin | NSEventPhase::NSEventPhaseBegan => {
+            Some(TouchPhase::Started)
+        }
+        NSEventPhase::NSEventPhaseChanged | NSEventPhase::NSEventPhaseStationary => {
+            Some(TouchPhase::Moved)
+        }
+        NSEventPhase::NSEventPhaseEnded => Some(TouchPhase::Ended),
+        NSEventPhase::NSEventPhaseCancelled => Some(TouchPhase::Cancelled),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod scroll_tests {
+    use super::*;
+
+    #[test]
+    fn native_contact_and_momentum_phases_remain_distinct() {
+        assert_eq!(scroll_phase(NSEventPhase::NSEventPhaseNone), None);
+        assert_eq!(
+            scroll_phase(NSEventPhase::NSEventPhaseMayBegin),
+            Some(TouchPhase::Started)
+        );
+        assert_eq!(
+            scroll_phase(NSEventPhase::NSEventPhaseBegan),
+            Some(TouchPhase::Started)
+        );
+        assert_eq!(
+            scroll_phase(NSEventPhase::NSEventPhaseChanged),
+            Some(TouchPhase::Moved)
+        );
+        assert_eq!(
+            scroll_phase(NSEventPhase::NSEventPhaseEnded),
+            Some(TouchPhase::Ended)
+        );
+        assert_eq!(
+            scroll_phase(NSEventPhase::NSEventPhaseCancelled),
+            Some(TouchPhase::Cancelled)
+        );
+        let momentum = ScrollGesture {
+            touch_phase: scroll_phase(NSEventPhase::NSEventPhaseNone),
+            momentum_phase: scroll_phase(NSEventPhase::NSEventPhaseChanged),
+        };
+        assert!(momentum.is_phased());
+        assert!(momentum.touch_phase.is_none());
+        assert_eq!(momentum.momentum_phase, Some(TouchPhase::Moved));
+    }
+}
 
 const BACKSPACE_KEY: u16 = 0x7f;
 const SPACE_KEY: u16 = b' ' as u16;
@@ -256,12 +307,9 @@ pub(crate) unsafe fn platform_input_from_native(
                 })
             }),
             NSEventType::NSScrollWheel => window_height.map(|window_height| {
-                let phase = match native_event.phase() {
-                    NSEventPhase::NSEventPhaseMayBegin | NSEventPhase::NSEventPhaseBegan => {
-                        TouchPhase::Started
-                    }
-                    NSEventPhase::NSEventPhaseEnded => TouchPhase::Ended,
-                    _ => TouchPhase::Moved,
+                let gesture = ScrollGesture {
+                    touch_phase: scroll_phase(native_event.phase()),
+                    momentum_phase: scroll_phase(native_event.momentumPhase()),
                 };
 
                 let raw_data = point(
@@ -281,7 +329,9 @@ pub(crate) unsafe fn platform_input_from_native(
                         window_height - px(native_event.locationInWindow().y as f32),
                     ),
                     delta,
-                    touch_phase: phase,
+                    touch_phase: gesture.touch_phase.unwrap_or_default(),
+                    gesture,
+                    timestamp: Duration::try_from_secs_f64(native_event.timestamp()).ok(),
                     modifiers: read_modifiers(native_event),
                 })
             }),

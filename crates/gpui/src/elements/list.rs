@@ -10,7 +10,7 @@
 use crate::{
     AnyElement, App, AvailableSpace, Bounds, ContentMask, DispatchPhase, Edges, Element, EntityId,
     FocusHandle, GlobalElementId, Hitbox, HitboxBehavior, InspectorElementId, IntoElement,
-    Overflow, Pixels, Point, ScrollDelta, ScrollWheelEvent, Size, Style, StyleRefinement, Styled,
+    Overflow, Pixels, Point, ScrollGesture, ScrollWheelEvent, Size, Style, StyleRefinement, Styled,
     Window, point, px, size,
 };
 use collections::VecDeque;
@@ -67,6 +67,7 @@ struct StateInner {
     alignment: ListAlignment,
     overdraw: Pixels,
     reset: bool,
+    scroll_gesture_active: bool,
     #[allow(clippy::type_complexity)]
     scroll_handler: Option<Box<dyn FnMut(&ListScrollEvent, &mut Window, &mut App)>>,
     scrollbar_drag_start_height: Option<Pixels>,
@@ -171,6 +172,7 @@ pub enum ListAlignment {
 }
 
 /// A scroll event that has been converted to be in terms of the list's items.
+#[derive(Clone, Debug, Default)]
 pub struct ListScrollEvent {
     /// The range of items currently visible in the list, after applying the scroll event.
     pub visible_range: Range<usize>,
@@ -183,6 +185,15 @@ pub struct ListScrollEvent {
 
     /// Whether the list is currently in follow-tail mode (auto-scrolling to end).
     pub is_following_tail: bool,
+
+    /// The precise displacement requested by this input, before clamping.
+    pub delta: Point<Pixels>,
+
+    /// Whether this input changed the visible scroll position.
+    pub position_changed: bool,
+
+    /// Native contact and inertia lifecycle, including zero-delta events.
+    pub gesture: ScrollGesture,
 }
 
 /// The sizing behavior to apply during layout.
@@ -323,6 +334,7 @@ impl ListState {
             overdraw,
             scroll_handler: None,
             reset: false,
+            scroll_gesture_active: false,
             scrollbar_drag_start_height: None,
             measuring_behavior: ListMeasuringBehavior::default(),
             pending_scroll: None,
@@ -421,7 +433,8 @@ impl ListState {
 
     /// Reset this instantiation of the list state.
     ///
-    /// Note that this will cause scroll events to be dropped until the next paint.
+    /// Scroll movement is ignored until the next paint; native gesture phases
+    /// are still delivered so consumers can release ownership of the viewport.
     pub fn reset(&self, element_count: usize) {
         let old_count = {
             let state = &mut *self.0.borrow_mut();
@@ -959,42 +972,59 @@ impl StateInner {
 
     fn scroll(
         &mut self,
-        scroll_top: &ListOffset,
         height: Pixels,
-        delta: Point<Pixels>,
+        event: &ScrollWheelEvent,
         current_view: EntityId,
         window: &mut Window,
         cx: &mut App,
     ) {
-        // Drop scroll events after a reset, since we can't calculate
-        // the new logical scroll top without the item heights
-        if self.reset {
+        let delta = event.delta.pixel_delta(px(20.));
+        if (self.reset || delta.y == px(0.)) && !event.gesture.is_phased() {
             return;
+        }
+        if let Some(phase) = event.gesture.momentum_phase.or(event.gesture.touch_phase) {
+            self.scroll_gesture_active =
+                matches!(phase, crate::TouchPhase::Started | crate::TouchPhase::Moved);
         }
 
         let padding = self.last_padding.unwrap_or_default();
         let scroll_max =
             (self.items.summary().height + padding.top + padding.bottom - height).max(px(0.));
-        let new_scroll_top = (self.scroll_top(scroll_top) - delta.y)
-            .max(px(0.))
-            .min(scroll_max);
-
-        if self.alignment == ListAlignment::Bottom && new_scroll_top == scroll_max {
-            self.pending_scroll = None;
-            self.logical_scroll_top = None;
+        // Read the latest position, not the last painted position. Every event
+        // must clamp independently: an overshoot followed by a reversal before
+        // the next frame must move away from the edge immediately.
+        let old_scroll_top = self.logical_scroll_top.map_or_else(
+            || match self.alignment {
+                ListAlignment::Top => px(0.),
+                ListAlignment::Bottom => scroll_max,
+            },
+            |offset| self.scroll_top(&offset),
+        );
+        let new_scroll_top = if self.reset || delta.y == px(0.) {
+            old_scroll_top
         } else {
-            let (start, ..) =
-                self.items
-                    .find::<ListItemSummary, _>((), &Height(new_scroll_top), Bias::Right);
-            let scroll_top = ListOffset {
-                item_ix: start.count,
-                offset_in_item: new_scroll_top - start.height,
-            };
-            // The user's scroll supersedes the position stashed by a
-            // remeasure; re-anchor the pending adjustment so it doesn't revert
-            // this scroll on the next layout.
-            self.rebase_pending_scroll(scroll_top);
-            self.logical_scroll_top = Some(scroll_top);
+            (old_scroll_top - delta.y).clamp(px(0.), scroll_max)
+        };
+        let position_changed = new_scroll_top != old_scroll_top;
+
+        if !self.reset && delta.y != px(0.) {
+            if self.alignment == ListAlignment::Bottom && new_scroll_top == scroll_max {
+                self.pending_scroll = None;
+                self.logical_scroll_top = None;
+            } else {
+                let (start, ..) =
+                    self.items
+                        .find::<ListItemSummary, _>((), &Height(new_scroll_top), Bias::Right);
+                let scroll_top = ListOffset {
+                    item_ix: start.count,
+                    offset_in_item: new_scroll_top - start.height,
+                };
+                // The user's scroll supersedes the position stashed by a
+                // remeasure; re-anchor the pending adjustment so it doesn't revert
+                // this scroll on the next layout.
+                self.rebase_pending_scroll(scroll_top);
+                self.logical_scroll_top = Some(scroll_top);
+            }
         }
 
         if delta.y > px(0.) {
@@ -1002,7 +1032,16 @@ impl StateInner {
         }
 
         if let Some(handler) = self.scroll_handler.as_mut() {
-            let visible_range = Self::visible_range(&self.items, height, scroll_top);
+            // Bottom alignment represents a pinned list with `None`, whose
+            // logical offset is the end sentinel, not the visible first row.
+            let (start, ..) =
+                self.items
+                    .find::<ListItemSummary, _>((), &Height(new_scroll_top), Bias::Right);
+            let scroll_top = ListOffset {
+                item_ix: start.count,
+                offset_in_item: new_scroll_top - start.height,
+            };
+            let visible_range = Self::visible_range(&self.items, height, &scroll_top);
             handler(
                 &ListScrollEvent {
                     visible_range,
@@ -1012,13 +1051,18 @@ impl StateInner {
                         self.follow_state,
                         FollowState::Tail { is_following: true }
                     ),
+                    delta,
+                    position_changed,
+                    gesture: event.gesture,
                 },
                 window,
                 cx,
             );
         }
 
-        cx.notify(current_view);
+        if position_changed {
+            cx.notify(current_view);
+        }
     }
 
     fn logical_scroll_top(&self) -> ListOffset {
@@ -1729,21 +1773,29 @@ impl Element for List {
 
         let list_state = self.state.clone();
         let height = bounds.size.height;
-        let scroll_top = prepaint.layout.scroll_top;
         let hitbox_id = prepaint.hitbox.id;
-        let mut accumulated_scroll_delta = ScrollDelta::default();
         window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
             if phase == DispatchPhase::Bubble && hitbox_id.should_handle_scroll(window) {
-                accumulated_scroll_delta = accumulated_scroll_delta.coalesce(event.delta);
-                let pixel_delta = accumulated_scroll_delta.pixel_delta(px(20.));
-                list_state.0.borrow_mut().scroll(
-                    &scroll_top,
-                    height,
-                    pixel_delta,
-                    current_view,
-                    window,
-                    cx,
+                list_state
+                    .0
+                    .borrow_mut()
+                    .scroll(height, event, current_view, window, cx)
+            } else if phase == DispatchPhase::Capture
+                && !hitbox_id.should_handle_scroll(window)
+                && matches!(
+                    event.gesture.momentum_phase.or(event.gesture.touch_phase),
+                    Some(crate::TouchPhase::Ended | crate::TouchPhase::Cancelled)
                 )
+                && list_state.0.borrow().scroll_gesture_active
+            {
+                // A pointer can leave the list before a native gesture ends.
+                // Deliver its termination without applying another view's delta.
+                let mut ending = event.clone();
+                ending.delta = crate::ScrollDelta::Pixels(Point::default());
+                list_state
+                    .0
+                    .borrow_mut()
+                    .scroll(height, &ending, current_view, window, cx);
             }
         });
     }
@@ -1853,7 +1905,7 @@ mod test {
 
     use crate::{
         self as gpui, AppContext, Bounds, Context, Element, FollowMode, IntoElement, ListState,
-        Render, Styled, TestAppContext, Window, canvas, div, list, point, px, size,
+        Point, Render, Styled, TestAppContext, Window, canvas, div, list, point, px, size,
     };
 
     #[gpui::test]
@@ -2035,6 +2087,93 @@ mod test {
             .w_full()
             .h_full()
         }
+    }
+
+    #[gpui::test]
+    fn precise_scroll_applies_each_sample_before_paint(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+        let state = ListState::new(20, crate::ListAlignment::Top, px(10.)).measure_all();
+        let view = cx.new(|_| TestListView(state.clone()));
+        cx.draw(Point::default(), size(px(100.), px(100.)), |_, _| {
+            view.clone().into_any_element()
+        });
+        let notifications = Rc::new(Cell::new(0));
+        let _subscription = cx.update(|_, cx| {
+            cx.observe(&view, {
+                let notifications = notifications.clone();
+                move |_, _| notifications.set(notifications.get() + 1)
+            })
+        });
+        let scroll = |dy| ScrollWheelEvent {
+            position: point(px(1.), px(1.)),
+            delta: ScrollDelta::Pixels(point(px(0.), px(dy))),
+            ..Default::default()
+        };
+        // Repeated input at the top changes no position and invalidates no view.
+        for _ in 0..10 {
+            cx.simulate_event(scroll(2.));
+        }
+        assert_eq!(notifications.get(), 0);
+        cx.simulate_event(scroll(-12.5));
+        cx.simulate_event(scroll(2.25));
+        cx.simulate_event(scroll(0.));
+        assert_eq!(state.scroll_px_offset_for_scrollbar().y, px(-10.25));
+        // Overshoot must be discarded at the edge before applying the reversal.
+        cx.simulate_event(scroll(-1000.));
+        cx.simulate_event(scroll(0.25));
+        assert_eq!(state.scroll_px_offset_for_scrollbar().y, px(-299.75));
+        assert_eq!(
+            notifications.get(),
+            4,
+            "only samples that move the list notify"
+        );
+    }
+
+    #[gpui::test]
+    fn native_scroll_phases_reach_handler_without_movement(cx: &mut TestAppContext) {
+        use crate::{ScrollGesture, TouchPhase};
+        let cx = cx.add_empty_window();
+        let state = ListState::new(20, crate::ListAlignment::Bottom, px(10.)).measure_all();
+        let events = Rc::new(std::cell::RefCell::new(Vec::new()));
+        state.set_scroll_handler({
+            let events = events.clone();
+            move |event, _, _| events.borrow_mut().push(event.clone())
+        });
+        let view = cx.new(|_| TestListView(state.clone()));
+        cx.draw(Point::default(), size(px(100.), px(100.)), |_, _| {
+            view.clone().into_any_element()
+        });
+        let notifications = Rc::new(Cell::new(0));
+        let _subscription = cx.update(|_, cx| {
+            cx.observe(&view, {
+                let notifications = notifications.clone();
+                move |_, _| notifications.set(notifications.get() + 1)
+            })
+        });
+        for (phase, position) in [
+            (TouchPhase::Started, point(px(1.), px(1.))),
+            (TouchPhase::Ended, point(px(150.), px(150.))),
+        ] {
+            cx.simulate_event(ScrollWheelEvent {
+                position,
+                gesture: ScrollGesture {
+                    momentum_phase: Some(phase),
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+        }
+        assert_eq!(
+            events.borrow().len(),
+            2,
+            "termination must survive leaving the hitbox"
+        );
+        for event in events.borrow().iter() {
+            assert!(!event.position_changed);
+            assert_eq!(event.visible_range.start, 15);
+            assert!(event.visible_range.end >= 20);
+        }
+        assert_eq!(notifications.get(), 0);
     }
 
     #[gpui::test]

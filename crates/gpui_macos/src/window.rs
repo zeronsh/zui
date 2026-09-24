@@ -582,6 +582,7 @@ struct MacWindowState {
     cursor_visible: Arc<AtomicBool>,
     frame_source: Option<WindowFrameSource>,
     frame_requested: Arc<AtomicBool>,
+    fixed_refresh_rate: bool,
     renderer: renderer::Renderer,
     overlay_renderer: Option<renderer::Renderer>,
     overlay_view: Option<NonNull<Object>>,
@@ -765,7 +766,11 @@ impl MacWindowState {
                 return;
             }
         }
-        let Some(display_id) = display_id_for_screen(unsafe { self.native_window.screen() }) else {
+        let screen = unsafe { self.native_window.screen() };
+        // Re-evaluate on screen changes and when waking a parked frame source,
+        // rather than querying AppKit on every display tick.
+        self.fixed_refresh_rate = screen_has_fixed_refresh_rate(screen);
+        let Some(display_id) = display_id_for_screen(screen) else {
             // AppKit can temporarily report no screen while displays are being reconfigured.
             return;
         };
@@ -995,6 +1000,7 @@ impl MacWindow {
                 cursor_visible,
                 frame_source: None,
                 frame_requested: Arc::new(AtomicBool::new(true)),
+                fixed_refresh_rate: false,
                 renderer: renderer::new_renderer(
                     renderer_context,
                     native_window as *mut _,
@@ -3035,8 +3041,12 @@ extern "C" fn step(view: *mut c_void) {
     let mut lock = window_state.lock();
 
     if let Some(mut callback) = lock.request_frame_callback.take() {
+        let options = RequestFrameOptions {
+            fixed_refresh_rate: lock.fixed_refresh_rate,
+            ..Default::default()
+        };
         drop(lock);
-        callback(Default::default());
+        callback(options);
         window_state.lock().request_frame_callback = Some(callback);
     }
 }
@@ -3397,6 +3407,27 @@ where
     }
 }
 
+fn screen_has_fixed_refresh_rate(screen: id) -> bool {
+    if screen.is_null() {
+        return false;
+    }
+
+    unsafe {
+        // These properties were introduced in macOS 12. Preserve the existing
+        // presentation policy if the display's timing is unavailable.
+        let has_intervals: BOOL =
+            msg_send![screen, respondsToSelector: sel!(minimumRefreshInterval)];
+        if has_intervals == NO {
+            return false;
+        }
+        let minimum: f64 = msg_send![screen, minimumRefreshInterval];
+        let maximum: f64 = msg_send![screen, maximumRefreshInterval];
+        // NSScreen documents equal intervals for fixed-rate displays. A zero
+        // or otherwise invalid interval does not identify a fixed-rate mode.
+        minimum.is_finite() && minimum > 0.0 && minimum == maximum
+    }
+}
+
 fn display_id_for_screen(screen: id) -> Option<CGDirectDisplayID> {
     if screen.is_null() {
         return None;
@@ -3603,5 +3634,10 @@ mod tests {
     #[test]
     fn display_id_for_screen_returns_none_for_null_screen() {
         assert_eq!(display_id_for_screen(nil), None);
+    }
+
+    #[test]
+    fn missing_screen_keeps_variable_refresh_presentation() {
+        assert!(!screen_has_fixed_refresh_rate(nil));
     }
 }

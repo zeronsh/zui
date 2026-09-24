@@ -2005,6 +2005,7 @@ impl X11ClientState {
                             window.refresh(RequestFrameOptions {
                                 require_presentation: expose_event_received,
                                 force_render,
+                                ..Default::default()
                             });
                         }
                         xcb_connection
@@ -2510,6 +2511,7 @@ fn make_scroll_wheel_event(
         delta: ScrollDelta::Lines(delta),
         modifiers,
         touch_phase: TouchPhase::default(),
+        ..Default::default()
     }
 }
 

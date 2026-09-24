@@ -533,6 +533,7 @@ impl WindowsWindowInner {
             }),
             modifiers,
             touch_phase: TouchPhase::Moved,
+            ..Default::default()
         });
         let handled = !func(input).propagate;
         self.state.callbacks.input.set(Some(func));
@@ -571,6 +572,7 @@ impl WindowsWindowInner {
             }),
             modifiers: current_modifiers(),
             touch_phase: TouchPhase::Moved,
+            ..Default::default()
         });
         let handled = !func(event).propagate;
         self.state.callbacks.input.set(Some(func));
@@ -1248,6 +1250,7 @@ impl WindowsWindowInner {
         request_frame(RequestFrameOptions {
             require_presentation: false,
             force_render,
+            ..Default::default()
         });
 
         self.state.callbacks.request_frame.set(Some(request_frame));
