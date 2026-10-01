@@ -1090,6 +1090,7 @@ pub struct Window {
     modifiers: Modifiers,
     capslock: Capslock,
     scale_factor: f32,
+    ui_scale: f32,
     pub(crate) bounds_observers: SubscriberSet<(), AnyObserver>,
     appearance: WindowAppearance,
     pub(crate) appearance_observers: SubscriberSet<(), AnyObserver>,
@@ -1694,7 +1695,9 @@ impl Window {
             let mut cx = cx.to_async();
             Box::new(move |event| {
                 handle
-                    .update(&mut cx, |_, window, cx| window.dispatch_event(event, cx))
+                    .update(&mut cx, |_, window, cx| {
+                        window.dispatch_event(event.into_ui_coordinates(window.ui_scale), cx)
+                    })
                     .log_err()
                     .unwrap_or(DispatchEventResult::default())
             })
@@ -1810,6 +1813,7 @@ impl Window {
             modifiers,
             capslock,
             scale_factor,
+            ui_scale: 1.0,
             bounds_observers: SubscriberSet::new(),
             appearance,
             appearance_observers: SubscriberSet::new(),
@@ -2362,10 +2366,10 @@ impl Window {
     /// the platform window, then notifies observers. Normally called automatically
     /// by the platform's resize callback, but exposed publicly for test infrastructure.
     pub fn bounds_changed(&mut self, cx: &mut App) {
-        self.scale_factor = self.platform_window.scale_factor();
-        self.viewport_size = self.platform_window.content_size();
+        self.scale_factor = self.platform_window.scale_factor() * self.ui_scale;
+        self.viewport_size = self.platform_window.content_size() / self.ui_scale;
         self.display_id = self.platform_window.display().map(|display| display.id());
-        self.mouse_position = self.platform_window.mouse_position();
+        self.mouse_position = self.platform_window.mouse_position() / self.ui_scale;
 
         self.refresh();
 
@@ -2449,7 +2453,8 @@ impl Window {
 
     /// Opens the native title bar context menu, useful when implementing client side decorations (Wayland and X11)
     pub fn show_window_menu(&self, position: Point<Pixels>) {
-        self.platform_window.show_window_menu(position)
+        self.platform_window
+            .show_window_menu(position * self.ui_scale)
     }
 
     /// Handle window movement for Linux and macOS.
@@ -2463,7 +2468,7 @@ impl Window {
     /// When using client side decorations, set this to the width of the invisible decorations (Wayland and X11)
     pub fn set_client_inset(&mut self, inset: Pixels) {
         self.client_inset = Some(inset);
-        self.platform_window.set_client_inset(inset);
+        self.platform_window.set_client_inset(inset * self.ui_scale);
     }
 
     /// Returns the client_inset value by [`Self::set_client_inset`].
@@ -2528,11 +2533,38 @@ impl Window {
         self.platform_window.show_character_palette();
     }
 
-    /// The scale factor of the display associated with the window. For example, it could
-    /// return 2.0 for a "retina" display, indicating that each logical pixel should actually
-    /// be rendered as two pixels on screen.
+    /// The render scale: the display's pixel density multiplied by [`Self::ui_scale`].
     pub fn scale_factor(&self) -> f32 {
         self.scale_factor
+    }
+
+    /// Application zoom, independent of the display's pixel density.
+    pub fn ui_scale(&self) -> f32 {
+        self.ui_scale
+    }
+
+    /// Scale the entire UI, including absolute pixel dimensions and input hit testing.
+    /// Native window bounds remain in platform coordinates; layout and dispatched
+    /// events use UI coordinates. Invalid factors are ignored.
+    pub fn set_ui_scale(&mut self, scale: f32) {
+        if !scale.is_finite() || scale <= 0.0 || scale == self.ui_scale {
+            return;
+        }
+        let ratio = self.ui_scale / scale;
+        self.ui_scale = scale;
+        self.scale_factor = self.platform_window.scale_factor() * scale;
+        self.viewport_size = self.platform_window.content_size() / scale;
+        self.mouse_position = self.mouse_position * ratio;
+        if let Some(inset) = self.client_inset {
+            self.platform_window.set_client_inset(inset * scale);
+        }
+        self.refresh();
+        self.invalidate_character_coordinates();
+    }
+
+    /// Convert layout bounds to platform logical pixels for native child surfaces or IME.
+    pub fn ui_to_platform_bounds(&self, bounds: Bounds<Pixels>) -> Bounds<Pixels> {
+        Bounds::new(bounds.origin * self.ui_scale, bounds.size * self.ui_scale)
     }
 
     /// The size of an em for the base font of the application. Adjusting this value allows the
@@ -5706,7 +5738,9 @@ impl Window {
         self.on_next_frame(|window, cx| {
             if let Some(mut input_handler) = window.platform_window.take_input_handler() {
                 if let Some(bounds) = input_handler.selected_bounds(window, cx) {
-                    window.platform_window.update_ime_position(bounds);
+                    window
+                        .platform_window
+                        .update_ime_position(window.ui_to_platform_bounds(bounds));
                 }
                 window.platform_window.set_input_handler(input_handler);
             }
@@ -6873,6 +6907,75 @@ mod tests {
                 root
             }
         }
+    }
+
+    #[test]
+    fn ui_scale_changes_layout_without_resizing_native_window_or_fonts() {
+        let mut cx = TestAppContext::single();
+        let child_bounds = Rc::new(Cell::new(Bounds::default()));
+        let window = cx.open_window(size(px(1200.), px(800.)), {
+            let child_bounds = child_bounds.clone();
+            move |_, _| RootView {
+                explicit_size: false,
+                child_bounds,
+            }
+        });
+        cx.update_window(window.into(), |_, window, cx| {
+            let native_bounds = window.bounds();
+            let rem_size = window.rem_size();
+            let display_scale = window.scale_factor();
+            window.set_ui_scale(1.5);
+            window.draw(cx).clear();
+            assert_eq!(window.viewport_size(), size(px(800.), px(800. / 1.5)));
+            assert_eq!(window.scale_factor(), display_scale * 1.5);
+            assert_eq!(window.bounds(), native_bounds);
+            assert_eq!(window.rem_size(), rem_size);
+            assert_eq!(child_bounds.get().size, window.viewport_size());
+            window.bounds_changed(cx);
+            assert_eq!(window.ui_scale(), 1.5);
+            assert_eq!(window.scale_factor(), display_scale * 1.5);
+            assert_eq!(
+                window.ui_to_platform_bounds(Bounds::new(
+                    crate::point(px(20.), px(40.)),
+                    size(px(100.), px(50.))
+                )),
+                Bounds::new(crate::point(px(30.), px(60.)), size(px(150.), px(75.)))
+            );
+            for invalid in [0., -1., f32::NAN, f32::INFINITY] {
+                window.set_ui_scale(invalid);
+                assert_eq!(window.ui_scale(), 1.5);
+            }
+            window.set_ui_scale(1.0);
+            assert_eq!(window.viewport_size(), native_bounds.size);
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn ui_scale_converts_native_pointer_and_pixel_scroll_input() {
+        let input = crate::PlatformInput::ScrollWheel(crate::ScrollWheelEvent {
+            position: crate::point(px(150.), px(90.)),
+            delta: crate::ScrollDelta::Pixels(crate::point(px(30.), px(60.))),
+            ..Default::default()
+        })
+        .into_ui_coordinates(1.5);
+        let crate::PlatformInput::ScrollWheel(event) = input else {
+            unreachable!()
+        };
+        assert_eq!(event.position, crate::point(px(100.), px(60.)));
+        assert_eq!(
+            event.delta,
+            crate::ScrollDelta::Pixels(crate::point(px(20.), px(40.)))
+        );
+        let input = crate::PlatformInput::ScrollWheel(crate::ScrollWheelEvent {
+            delta: crate::ScrollDelta::Lines(crate::point(2., 3.)),
+            ..Default::default()
+        })
+        .into_ui_coordinates(2.);
+        let crate::PlatformInput::ScrollWheel(event) = input else {
+            unreachable!()
+        };
+        assert_eq!(event.delta, crate::ScrollDelta::Lines(crate::point(2., 3.)));
     }
 
     #[test]

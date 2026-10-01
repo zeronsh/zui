@@ -760,6 +760,31 @@ pub enum PlatformInput {
 }
 
 impl PlatformInput {
+    /// Convert native logical pixels to application UI coordinates at the platform boundary.
+    pub(crate) fn into_ui_coordinates(mut self, scale: f32) -> Self {
+        match &mut self {
+            Self::MouseDown(event) => event.position = event.position / scale,
+            Self::MouseUp(event) => event.position = event.position / scale,
+            Self::MouseMove(event) => event.position = event.position / scale,
+            Self::ScrollWheel(event) => {
+                event.position = event.position / scale;
+                if let ScrollDelta::Pixels(delta) = &mut event.delta {
+                    *delta = *delta / scale;
+                }
+            }
+            Self::Pinch(event) => event.position = event.position / scale,
+            Self::Touch(event) => event.position = event.position / scale,
+            Self::FileDrop(event) => match event {
+                FileDropEvent::Entered { position, .. }
+                | FileDropEvent::Pending { position }
+                | FileDropEvent::Submit { position } => *position = *position / scale,
+                FileDropEvent::Exited => {}
+            },
+            _ => {}
+        }
+        self
+    }
+
     pub(crate) fn mouse_event(&self) -> Option<&dyn Any> {
         match self {
             PlatformInput::KeyDown { .. } => None,
