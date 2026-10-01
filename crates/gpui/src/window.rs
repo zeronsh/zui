@@ -6963,10 +6963,10 @@ mod tests {
             unreachable!()
         };
         assert_eq!(event.position, crate::point(px(100.), px(60.)));
-        assert_eq!(
-            event.delta,
-            crate::ScrollDelta::Pixels(crate::point(px(20.), px(40.)))
-        );
+        let crate::ScrollDelta::Pixels(delta) = event.delta else {
+            panic!("pixel scroll changed units")
+        };
+        assert_eq!(delta, crate::point(px(20.), px(40.)));
         let input = crate::PlatformInput::ScrollWheel(crate::ScrollWheelEvent {
             delta: crate::ScrollDelta::Lines(crate::point(2., 3.)),
             ..Default::default()
@@ -6975,7 +6975,10 @@ mod tests {
         let crate::PlatformInput::ScrollWheel(event) = input else {
             unreachable!()
         };
-        assert_eq!(event.delta, crate::ScrollDelta::Lines(crate::point(2., 3.)));
+        let crate::ScrollDelta::Lines(delta) = event.delta else {
+            panic!("line scroll changed units")
+        };
+        assert_eq!(delta, crate::point(2., 3.));
     }
 
     #[test]
