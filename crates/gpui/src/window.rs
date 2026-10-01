@@ -2564,7 +2564,7 @@ impl Window {
 
     /// Convert layout bounds to platform logical pixels for native child surfaces or IME.
     pub fn ui_to_platform_bounds(&self, bounds: Bounds<Pixels>) -> Bounds<Pixels> {
-        Bounds::new(bounds.origin * self.ui_scale, bounds.size * self.ui_scale)
+        bounds.map(|value| value * self.ui_scale)
     }
 
     /// The size of an em for the base font of the application. Adjusting this value allows the
