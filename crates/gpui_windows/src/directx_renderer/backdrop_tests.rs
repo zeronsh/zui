@@ -815,6 +815,8 @@ fn warp_translucent_sprites_keep_backdrop_at_scaled_edges() -> Result<()> {
                     fade: EdgeFadeParams::default(),
                     tile,
                     transformation: TransformationMatrix::default(),
+                    blur: 0.0,
+                    pad2: 0.0,
                 });
             } else {
                 scene.polychrome_sprites.push(PolychromeSprite {

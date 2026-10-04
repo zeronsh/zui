@@ -1278,6 +1278,8 @@ struct MonochromeSprite {
     tile: AtlasTile,
     transformation: TransformationMatrix,
     fade: EdgeFadeParams,
+    blur: f32,
+    pad2: f32,
 }
 @group(1) @binding(0) var<storage, read> b_mono_sprites: array<MonochromeSprite>;
 
@@ -1297,7 +1299,17 @@ fn vs_mono_sprite(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index
     var out = MonoSpriteVarying();
     out.position = to_device_position_transformed(unit_vertex, sprite.bounds, sprite.transformation);
 
-    out.tile_position = to_tile_position(unit_vertex, sprite.tile);
+    // A blurred sprite's quad is inflated by 3*sigma per side; map uv so the
+    // content keeps its size and the margin addresses past the tile — the
+    // fragment zeroes those taps. Tile pixels scale by tile/quad (SVGs
+    // rasterize oversampled), so with zero blur this is to_tile_position.
+    let blur_pad = 3.0 * sprite.blur;
+    let atlas_size = vec2<f32>(textureDimensions(t_sprite, 0));
+    let quad_size = sprite.bounds.size;
+    let unpadded_size = max(quad_size - vec2<f32>(2.0 * blur_pad), vec2<f32>(1e-6));
+    let tile_size = vec2<f32>(sprite.tile.bounds.size);
+    let tile_px = (unit_vertex * quad_size - vec2<f32>(blur_pad)) * (tile_size / unpadded_size);
+    out.tile_position = (vec2<f32>(sprite.tile.bounds.origin) + tile_px) / atlas_size;
     out.color = hsla_to_rgba(sprite.color);
     out.sprite_id = instance_id;
     out.clip_distances = distance_from_clip_rect_transformed(unit_vertex, sprite.bounds, sprite.content_mask, sprite.transformation);
@@ -1306,7 +1318,38 @@ fn vs_mono_sprite(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index
 
 @fragment
 fn fs_mono_sprite(input: MonoSpriteVarying) -> @location(0) vec4<f32> {
-    let sample = textureSample(t_sprite, s_sprite, input.tile_position).r;
+    let sprite = b_mono_sprites[input.sprite_id];
+    var sample = textureSample(t_sprite, s_sprite, input.tile_position).r;
+    if (sprite.blur > 0.0) {
+        // Gaussian taps around the texel; taps outside the tile read as
+        // transparent, in-tile taps clamp half a texel in so linear
+        // filtering never bleeds a neighboring glyph.
+        let sigma = sprite.blur;
+        let atlas_size = vec2<f32>(textureDimensions(t_sprite, 0));
+        let texel = vec2<f32>(1.0) / atlas_size;
+        let tile_min = vec2<f32>(sprite.tile.bounds.origin) / atlas_size;
+        let tile_max = tile_min + vec2<f32>(sprite.tile.bounds.size) / atlas_size;
+        let tile_mid = 0.5 * (tile_min + tile_max);
+        let inset_min = min(tile_min + 0.5 * texel, tile_mid);
+        let inset_max = max(tile_max - 0.5 * texel, tile_mid);
+        let radius = min(i32(ceil(3.0 * sigma)), 12);
+        var accum = 0.0;
+        var total = 0.0;
+        for (var y = -radius; y <= radius; y++) {
+            for (var x = -radius; x <= radius; x++) {
+                let offset = vec2<f32>(f32(x), f32(y));
+                let weight = exp(-dot(offset, offset) / (2.0 * sigma * sigma));
+                let uv = input.tile_position + offset * texel;
+                var tap = 0.0;
+                if (all(uv >= tile_min) && all(uv <= tile_max)) {
+                    tap = textureSampleLevel(t_sprite, s_sprite, clamp(uv, inset_min, inset_max), 0.0).r;
+                }
+                accum += weight * tap;
+                total += weight;
+            }
+        }
+        sample = accum / max(total, 1e-6);
+    }
     let alpha_corrected = apply_contrast_and_gamma_correction(sample, input.color.rgb, gamma_params.grayscale_enhanced_contrast, gamma_params.gamma_ratios);
 
     // Alpha clip after using the derivatives.
@@ -1314,7 +1357,7 @@ fn fs_mono_sprite(input: MonoSpriteVarying) -> @location(0) vec4<f32> {
         return vec4<f32>(0.0);
     }
 
-    return blend_color(input.color, alpha_corrected * edge_fade_alpha(input.position.xy, b_mono_sprites[input.sprite_id].fade));
+    return blend_color(input.color, alpha_corrected * edge_fade_alpha(input.position.xy, sprite.fade));
 }
 
 // --- polychrome sprites --- //

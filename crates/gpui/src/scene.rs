@@ -812,6 +812,12 @@ pub struct MonochromeSprite {
     pub tile: AtlasTile,
     pub transformation: TransformationMatrix,
     pub fade: EdgeFadeParams,
+    /// Gaussian blur sigma in device pixels; 0 samples the glyph crisp.
+    /// The quad must be inflated by `3 * blur` on each side (see
+    /// `Window::paint_glyph_transformed`) so the halo has room.
+    pub blur: f32,
+    /// Keeps the struct's size a multiple of 8 bytes for the WGSL mirror.
+    pub pad2: f32,
 }
 
 impl From<MonochromeSprite> for Primitive {
@@ -832,6 +838,10 @@ pub struct SubpixelSprite {
     pub tile: AtlasTile,
     pub transformation: TransformationMatrix,
     pub fade: EdgeFadeParams,
+    /// Unused; keeps the layout identical to [`MonochromeSprite`] (the
+    /// DirectX subpixel pipeline reads both through one struct).
+    pub blur: f32,
+    pub pad2: f32,
 }
 
 impl From<SubpixelSprite> for Primitive {
@@ -1252,6 +1262,8 @@ mod tests {
                 content_mask: ContentMask { bounds: bounds() },
                 color: crate::black(),
                 fade: EdgeFadeParams::default(),
+                blur: 0.0,
+                pad2: 0.0,
                 tile: AtlasTile {
                     texture_id: AtlasTextureId {
                         index,

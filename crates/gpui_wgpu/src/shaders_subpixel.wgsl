@@ -9,6 +9,9 @@ struct SubpixelSprite {
     tile: AtlasTile,
     transformation: TransformationMatrix,
     fade: EdgeFadeParams,
+    // Unused here; keeps the layout identical to MonochromeSprite.
+    blur: f32,
+    pad2: f32,
 }
 @group(1) @binding(0) var<storage, read> b_subpixel_sprites: array<SubpixelSprite>;
 

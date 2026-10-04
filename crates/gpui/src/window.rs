@@ -4371,6 +4371,8 @@ impl Window {
                     tile,
                     transformation: TransformationMatrix::unit(),
                     fade: self.scaled_edge_fade(),
+                    blur: 0.0,
+                    pad2: 0.0,
                 });
             } else {
                 self.next_frame.scene.insert_primitive(MonochromeSprite {
@@ -4382,6 +4384,8 @@ impl Window {
                     tile,
                     transformation: TransformationMatrix::unit(),
                     fade: self.scaled_edge_fade(),
+                    blur: 0.0,
+                    pad2: 0.0,
                 });
             }
         }
@@ -4405,6 +4409,100 @@ impl Window {
         };
 
         mode == TextRenderingMode::Subpixel
+    }
+
+    /// Paints a monochrome glyph like [`Self::paint_glyph`], with a
+    /// [`TransformationMatrix`] applied at composite time (device-pixel
+    /// space — e.g. scale or rotate about the glyph's center) and an
+    /// optional gaussian `blur` (sigma, logical pixels).
+    ///
+    /// Always renders through the plain-alpha pipeline: subpixel RGB masks
+    /// cannot be transformed or blurred. The glyph rasterizes once at
+    /// `font_size`; motion belongs in the matrix, so animating it never
+    /// grows the atlas.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn paint_glyph_transformed(
+        &mut self,
+        origin: Point<Pixels>,
+        font_id: FontId,
+        glyph_id: GlyphId,
+        font_size: Pixels,
+        color: Hsla,
+        transformation: TransformationMatrix,
+        blur: Pixels,
+    ) -> Result<()> {
+        self.invalidator.debug_assert_paint();
+
+        let element_opacity = self.element_opacity();
+        let scale_factor = self.scale_factor();
+        let glyph_origin = origin.scale(scale_factor);
+
+        let quantized_origin = Point::new(
+            round_half_toward_zero(glyph_origin.x.0 * SUBPIXEL_VARIANTS_X as f32)
+                / SUBPIXEL_VARIANTS_X as f32,
+            round_half_toward_zero(glyph_origin.y.0 * SUBPIXEL_VARIANTS_Y as f32)
+                / SUBPIXEL_VARIANTS_Y as f32,
+        );
+        let subpixel_variant = Point::new(
+            (quantized_origin.x.fract() * SUBPIXEL_VARIANTS_X as f32) as u8,
+            (quantized_origin.y.fract() * SUBPIXEL_VARIANTS_Y as f32) as u8,
+        );
+        let integer_origin = quantized_origin.map(|c| ScaledPixels(c.trunc()));
+        let dilation = self.text_system().glyph_dilation_for_color(color);
+        let params = RenderGlyphParams {
+            font_id,
+            glyph_id,
+            font_size,
+            subpixel_variant,
+            scale_factor,
+            is_emoji: false,
+            subpixel_rendering: false,
+            dilation,
+        };
+
+        let raster_bounds = self.text_system().raster_bounds(&params)?;
+        if !raster_bounds.is_zero() {
+            let tile = self
+                .sprite_atlas
+                .get_or_insert_with(&params.clone().into(), &mut || {
+                    let (size, bytes) = self.text_system().rasterize_glyph(&params)?;
+                    Ok(Some((size, Cow::Owned(bytes))))
+                })?
+                .expect("Callback above only errors or returns Some");
+            let blur = (blur.0 * scale_factor).max(0.0);
+            // The shaders re-derive this inflation from `blur` to map the
+            // quad onto the tile, so the two must stay in lockstep.
+            let blur_pad = ScaledPixels(3.0 * blur);
+            let glyph_bounds = Bounds {
+                origin: integer_origin + raster_bounds.origin.map(Into::into),
+                size: tile.bounds.size.map(Into::into),
+            };
+            let bounds = Bounds {
+                origin: point(
+                    glyph_bounds.origin.x - blur_pad,
+                    glyph_bounds.origin.y - blur_pad,
+                ),
+                size: size(
+                    glyph_bounds.size.width + blur_pad + blur_pad,
+                    glyph_bounds.size.height + blur_pad + blur_pad,
+                ),
+            };
+            let content_mask = self.snapped_content_mask();
+            self.next_frame.scene.insert_primitive(MonochromeSprite {
+                order: 0,
+                pad: 0,
+                bounds,
+                content_mask,
+                color: color.opacity(element_opacity),
+                tile,
+                transformation,
+                fade: self.scaled_edge_fade(),
+                blur,
+                pad2: 0.0,
+            });
+        }
+        Ok(())
     }
 
     /// Paints an emoji glyph into the scene for the next frame at the current z-index.
@@ -4537,6 +4635,8 @@ impl Window {
             tile,
             transformation,
             fade,
+            blur: 0.0,
+            pad2: 0.0,
         });
 
         Ok(())

@@ -1177,6 +1177,8 @@ struct MonochromeSprite {
     AtlasTile tile;
     TransformationMatrix transformation;
     EdgeFadeParams fade;
+    float blur;
+    float pad2;
 };
 
 struct MonochromeSpriteVertexOutput {
@@ -1203,7 +1205,18 @@ MonochromeSpriteVertexOutput monochrome_sprite_vertex(uint vertex_id: SV_VertexI
     float4 device_position =
         to_device_position_transformed(unit_vertex, sprite.bounds, sprite.transformation);
     float4 clip_distance = distance_from_clip_rect_transformed(unit_vertex, sprite.bounds, sprite.content_mask, sprite.transformation);
-    float2 tile_position = to_tile_position(unit_vertex, sprite.tile);
+    // A blurred sprite's quad is inflated by 3*sigma per side; map uv so the
+    // content keeps its size and the margin addresses past the tile — the
+    // fragment zeroes those taps. Tile pixels scale by tile/quad (SVGs
+    // rasterize oversampled), so with zero blur — including every subpixel
+    // sprite sharing this vertex — this reduces to to_tile_position.
+    float blur_pad = 3.0 * sprite.blur;
+    float2 vertex_atlas_size;
+    t_sprite.GetDimensions(vertex_atlas_size.x, vertex_atlas_size.y);
+    float2 quad_size = sprite.bounds.size;
+    float2 unpadded_size = max(quad_size - 2.0 * blur_pad, float2(1e-6, 1e-6));
+    float2 tile_px = (unit_vertex * quad_size - blur_pad) * (float2(sprite.tile.bounds.size) / unpadded_size);
+    float2 tile_position = (float2(sprite.tile.bounds.origin) + tile_px) / vertex_atlas_size;
     float4 color = hsla_to_rgba(sprite.color);
 
     MonochromeSpriteVertexOutput output;
@@ -1216,9 +1229,41 @@ MonochromeSpriteVertexOutput monochrome_sprite_vertex(uint vertex_id: SV_VertexI
 }
 
 float4 monochrome_sprite_fragment(MonochromeSpriteFragmentInput input): SV_Target {
+    MonochromeSprite sprite = mono_sprites[input.sprite_id];
     float sample = t_sprite.Sample(s_sprite, input.tile_position).r;
+    if (sprite.blur > 0.0) {
+        // Gaussian taps around the texel; taps outside the tile read as
+        // transparent, in-tile taps clamp half a texel in so linear
+        // filtering never bleeds a neighboring glyph.
+        float sigma = sprite.blur;
+        float2 atlas_size;
+        t_sprite.GetDimensions(atlas_size.x, atlas_size.y);
+        float2 texel = 1.0 / atlas_size;
+        float2 tile_min = float2(sprite.tile.bounds.origin) / atlas_size;
+        float2 tile_max = tile_min + float2(sprite.tile.bounds.size) / atlas_size;
+        float2 tile_mid = 0.5 * (tile_min + tile_max);
+        float2 inset_min = min(tile_min + 0.5 * texel, tile_mid);
+        float2 inset_max = max(tile_max - 0.5 * texel, tile_mid);
+        int radius = min(int(ceil(3.0 * sigma)), 12);
+        float accum = 0.0;
+        float total = 0.0;
+        for (int y = -radius; y <= radius; y++) {
+            for (int x = -radius; x <= radius; x++) {
+                float2 offset = float2(x, y);
+                float weight = exp(-dot(offset, offset) / (2.0 * sigma * sigma));
+                float2 uv = input.tile_position + offset * texel;
+                float tap = 0.0;
+                if (all(uv >= tile_min) && all(uv <= tile_max)) {
+                    tap = t_sprite.SampleLevel(s_sprite, clamp(uv, inset_min, inset_max), 0).r;
+                }
+                accum += weight * tap;
+                total += weight;
+            }
+        }
+        sample = accum / max(total, 1e-6);
+    }
     float alpha_corrected = apply_contrast_and_gamma_correction(sample, input.color.rgb, grayscale_enhanced_contrast, gamma_ratios);
-    return float4(input.color.rgb, input.color.a * alpha_corrected * edge_fade_alpha(input.position.xy, mono_sprites[input.sprite_id].fade));
+    return float4(input.color.rgb, input.color.a * alpha_corrected * edge_fade_alpha(input.position.xy, sprite.fade));
 }
 
 MonochromeSpriteVertexOutput subpixel_sprite_vertex(uint vertex_id: SV_VertexID, uint sprite_id: SV_InstanceID) {

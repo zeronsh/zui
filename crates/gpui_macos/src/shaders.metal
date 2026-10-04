@@ -655,7 +655,24 @@ vertex MonochromeSpriteVertexOutput monochrome_sprite_vertex(
       to_device_position_transformed(unit_vertex, sprite.bounds, sprite.transformation, viewport_size);
   float4 clip_distance = distance_from_clip_rect_transformed(unit_vertex, sprite.bounds,
                                                  sprite.content_mask.bounds, sprite.transformation);
-  float2 tile_position = to_tile_position(unit_vertex, sprite.tile, atlas_size);
+  // A blurred sprite's quad is inflated by 3*sigma per side (the CPU and
+  // this derivation must agree); map uv so the content keeps its size and
+  // the margin addresses past the tile — the fragment zeroes those taps.
+  // Tile pixels scale by tile/quad (SVGs rasterize oversampled), so with
+  // zero blur this is exactly to_tile_position.
+  float blur_pad = 3.0 * sprite.blur;
+  float2 quad_size =
+      float2(sprite.bounds.size.width, sprite.bounds.size.height);
+  float2 unpadded_size = max(quad_size - 2.0 * blur_pad, float2(1e-6));
+  float2 tile_origin =
+      float2(sprite.tile.bounds.origin.x, sprite.tile.bounds.origin.y);
+  float2 tile_size =
+      float2(sprite.tile.bounds.size.width, sprite.tile.bounds.size.height);
+  float2 tile_px =
+      (unit_vertex * quad_size - blur_pad) * (tile_size / unpadded_size);
+  float2 tile_position =
+      (tile_origin + tile_px) /
+      float2((float)atlas_size->width, (float)atlas_size->height);
   float4 color = hsla_to_rgba(sprite.color);
   return MonochromeSpriteVertexOutput{
       device_position,
@@ -675,10 +692,52 @@ fragment float4 monochrome_sprite_fragment(
 
   constexpr sampler atlas_texture_sampler(mag_filter::linear,
                                           min_filter::linear);
-  float4 sample =
-      atlas_texture.sample(atlas_texture_sampler, input.tile_position);
+  MonochromeSprite sprite = sprites[input.sprite_id];
+  float alpha;
+  if (sprite.blur > 0.0) {
+    // Gaussian taps around the texel; taps outside the tile read as
+    // transparent, in-tile taps clamp half a texel in so linear filtering
+    // never bleeds a neighboring glyph.
+    float sigma = sprite.blur;
+    float2 atlas_dims =
+        float2(atlas_texture.get_width(), atlas_texture.get_height());
+    float2 texel = 1.0 / atlas_dims;
+    float2 tile_min =
+        float2(sprite.tile.bounds.origin.x, sprite.tile.bounds.origin.y) /
+        atlas_dims;
+    float2 tile_max =
+        tile_min +
+        float2(sprite.tile.bounds.size.width, sprite.tile.bounds.size.height) /
+            atlas_dims;
+    float2 tile_mid = 0.5 * (tile_min + tile_max);
+    float2 inset_min = min(tile_min + 0.5 * texel, tile_mid);
+    float2 inset_max = max(tile_max - 0.5 * texel, tile_mid);
+    int radius = min(int(ceil(3.0 * sigma)), 12);
+    float accum = 0.0;
+    float total = 0.0;
+    for (int y = -radius; y <= radius; y++) {
+      for (int x = -radius; x <= radius; x++) {
+        float2 offset = float2(x, y);
+        float weight = exp(-dot(offset, offset) / (2.0 * sigma * sigma));
+        float2 uv = input.tile_position + offset * texel;
+        float tap = 0.0;
+        if (all(uv >= tile_min) && all(uv <= tile_max)) {
+          tap = atlas_texture
+                    .sample(atlas_texture_sampler, clamp(uv, inset_min, inset_max),
+                            level(0))
+                    .a;
+        }
+        accum += weight * tap;
+        total += weight;
+      }
+    }
+    alpha = accum / max(total, 1e-6);
+  } else {
+    alpha =
+        atlas_texture.sample(atlas_texture_sampler, input.tile_position).a;
+  }
   float4 color = input.color;
-  color.a *= sample.a * edge_fade_alpha(input.position.xy, sprites[input.sprite_id].fade);
+  color.a *= alpha * edge_fade_alpha(input.position.xy, sprite.fade);
   return color;
 }
 

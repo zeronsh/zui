@@ -2542,6 +2542,8 @@ mod backdrop_blur_tests {
                 },
                 tile,
                 transformation: TransformationMatrix::unit(),
+                blur: 0.0,
+                pad2: 0.0,
                 fade: EdgeFadeParams {
                     right_x: edge,
                     band_right: band,
