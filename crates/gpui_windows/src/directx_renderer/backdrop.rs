@@ -273,6 +273,7 @@ impl DirectXRenderer {
         }
         let downsample = ((sigma / 8.) as u32).clamp(1, 4);
         let devices = self.devices.as_ref().context("devices missing")?;
+        let source = self.backdrop_source.clone();
         let resources = self.resources.as_mut().context("resources missing")?;
         if resources.backdrop.is_none() {
             resources.backdrop = Some(BackdropResources::new(&devices.device)?);
@@ -306,9 +307,9 @@ impl DirectXRenderer {
                 0,
                 0,
                 0,
-                resources
-                    .render_target
+                source
                     .as_ref()
+                    .or(resources.render_target.as_ref())
                     .context("missing render target")?,
                 0,
                 Some(&D3D11_BOX {

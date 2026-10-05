@@ -790,6 +790,19 @@ pub enum TextInputStateChange {
     ContentChanged,
 }
 
+/// Raw composition handles for embedding native surfaces (Windows:
+/// `IDCompositionDevice*` and an `IDCompositionVisual*` layer). Both are
+/// borrowed for the window's lifetime; never release them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NativeComposition {
+    /// The device that owns the layer.
+    pub device: *mut std::ffi::c_void,
+    /// The container beneath GPUI's overlay plane and above its base plane.
+    pub layer: *mut std::ffi::c_void,
+    /// Changes when GPU recovery recreates the device; remount children.
+    pub generation: u64,
+}
+
 #[expect(missing_docs)]
 pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn bounds(&self) -> Bounds<Pixels>;
@@ -853,6 +866,12 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     /// Enable a transparent scene plane above native children, once per window.
     fn enable_scene_overlay(&self) -> anyhow::Result<()> {
         anyhow::bail!("Native scene overlays are unavailable on this platform")
+    }
+
+    /// Where native children composite between the base and overlay planes.
+    /// Available on Windows once [`Self::enable_scene_overlay`] succeeded.
+    fn native_composition(&self) -> Option<NativeComposition> {
+        None
     }
 
     fn completed_frame(&self) {}
