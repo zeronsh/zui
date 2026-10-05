@@ -858,13 +858,14 @@ fn face_info_into_properties(
 }
 
 fn check_is_known_emoji_font(postscript_name: &str) -> bool {
-    // TODO: Include other common emoji fonts
-    postscript_name == "NotoColorEmoji"
+    matches!(postscript_name, "NotoColorEmoji" | "TwemojiMozilla")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use gpui::{font, px};
 
     fn fid(i: usize) -> FontId {
         FontId(i)
@@ -1058,5 +1059,81 @@ mod tests {
         let covers = |_: FontId, _: char| true;
         let spans = compute_run_spans("anything", 3, 0, primary, &fb, &covers);
         assert!(spans.is_empty());
+    }
+    #[test]
+    fn browser_bundle_renders_text_and_color_emoji_sequences() {
+        let system = CosmicTextSystem::new_without_system_fonts("IBM Plex Sans");
+        system
+            .add_fonts(vec![
+                Cow::Borrowed(include_bytes!(
+                    "../../../assets/fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf"
+                )),
+                Cow::Borrowed(include_bytes!(
+                    "../../../assets/fonts/lilex/Lilex-Regular.ttf"
+                )),
+                Cow::Borrowed(include_bytes!(
+                    "../../../assets/fonts/twemoji-mozilla/Twemoji.Mozilla.ttf"
+                )),
+            ])
+            .unwrap();
+        let font_id = system.font_id(&font("IBM Plex Sans")).unwrap();
+        let text = "ordinary 😀 text ❤️ 👍🏽 👩‍💻";
+        let layout = system.layout_line(
+            text,
+            px(16.0),
+            &[FontRun {
+                len: text.len(),
+                font_id,
+            }],
+        );
+
+        assert!(layout.width > px(0.0));
+        assert!(
+            layout
+                .runs
+                .iter()
+                .flat_map(|run| &run.glyphs)
+                .any(|glyph| !glyph.is_emoji),
+            "ordinary text lost its monochrome glyphs: {layout:?}"
+        );
+        for sequence in ["😀", "❤️", "👍🏽", "👩‍💻"] {
+            let start = text.find(sequence).unwrap();
+            let (emoji_font_id, glyph_id) = layout
+                .runs
+                .iter()
+                .flat_map(|run| run.glyphs.iter().map(move |glyph| (run.font_id, glyph)))
+                .find(|(_, glyph)| {
+                    glyph.is_emoji && glyph.index >= start && glyph.index < start + sequence.len()
+                })
+                .map(|(font_id, glyph)| (font_id, glyph.id))
+                .unwrap_or_else(|| panic!("emoji sequence {sequence:?} was not shaped"));
+
+            let params = RenderGlyphParams {
+                font_id: emoji_font_id,
+                glyph_id,
+                font_size: px(16.0),
+                subpixel_variant: Default::default(),
+                scale_factor: 1.0,
+                is_emoji: true,
+                subpixel_rendering: false,
+                dilation: 0,
+            };
+            let bounds = system.glyph_raster_bounds(&params).unwrap();
+            let (size, pixels) = system.rasterize_glyph(&params, bounds).unwrap();
+            assert!(
+                size.width.0 > 0 && size.height.0 > 0,
+                "emoji sequence {sequence:?} rasterized to empty bounds: {params:?}"
+            );
+            assert_eq!(
+                pixels.len(),
+                size.width.0 as usize * size.height.0 as usize * 4
+            );
+            assert!(
+                pixels
+                    .chunks_exact(4)
+                    .any(|pixel| { pixel[0] != pixel[1] || pixel[1] != pixel[2] }),
+                "emoji sequence {sequence:?} rasterized without color: {params:?}"
+            );
+        }
     }
 }

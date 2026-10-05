@@ -900,6 +900,8 @@ pub(crate) struct Frame {
     pub(crate) window_control_hitboxes: Vec<(WindowControlArea, Hitbox)>,
     pub(crate) deferred_draws: Vec<DeferredDraw>,
     pub(crate) input_handlers: Vec<Option<PlatformInputHandler>>,
+    // All mounted input targets, including editors that are not focused yet.
+    input_focus_handles: Vec<FocusId>,
     pub(crate) tooltip_requests: Vec<Option<TooltipRequest>>,
     pub(crate) cursor_styles: Vec<CursorStyleRequest>,
     #[cfg(any(test, feature = "test-support"))]
@@ -927,6 +929,7 @@ pub(crate) struct PaintIndex {
     presentation_callbacks_index: usize,
     mouse_listeners_index: usize,
     input_handlers_index: usize,
+    input_focus_handles_index: usize,
     cursor_styles_index: usize,
     accessed_element_states_index: usize,
     tab_handle_index: usize,
@@ -950,6 +953,7 @@ impl Frame {
             window_control_hitboxes: Vec::new(),
             deferred_draws: Vec::new(),
             input_handlers: Vec::new(),
+            input_focus_handles: Vec::new(),
             tooltip_requests: Vec::new(),
             cursor_styles: Vec::new(),
 
@@ -975,6 +979,7 @@ impl Frame {
         self.overlay_capture_input = false;
         self.presentation_callbacks.clear();
         self.input_handlers.clear();
+        self.input_focus_handles.clear();
         self.tooltip_requests.clear();
         self.cursor_styles.clear();
         self.hitboxes.clear();
@@ -1120,6 +1125,7 @@ pub struct Window {
     pub(crate) activation_observers: SubscriberSet<(), AnyObserver>,
     pub(crate) focus: Option<FocusId>,
     focus_enabled: bool,
+    focus_requested_during_dispatch: bool,
     /// Incremented every time focus moves. Used to invalidate a
     /// pending keyboard activation state when focus changes.
     pub(crate) focus_generation: u64,
@@ -1838,6 +1844,7 @@ impl Window {
             activation_observers: SubscriberSet::new(),
             focus: None,
             focus_enabled: true,
+            focus_requested_during_dispatch: false,
             focus_generation: 0,
             pending_input: None,
             pending_modifier: ModifierState::default(),
@@ -1994,6 +2001,10 @@ impl Window {
 
     /// Move focus to the element associated with the given [`FocusHandle`].
     pub fn focus(&mut self, handle: &FocusHandle, cx: &mut App) {
+        // A press on an already-focused editor is still an explicit request.
+        if self.focus_enabled {
+            self.focus_requested_during_dispatch = true;
+        }
         if !self.focus_enabled || self.focus == Some(handle.id) {
             return;
         }
@@ -2026,6 +2037,7 @@ impl Window {
             self.focus_generation = self.focus_generation.wrapping_add(1);
         }
         self.focus = None;
+        self.focus_requested_during_dispatch = true;
         self.refresh();
     }
 
@@ -3337,6 +3349,7 @@ impl Window {
             presentation_callbacks_index: self.next_frame.presentation_callbacks.len(),
             mouse_listeners_index: self.next_frame.mouse_listeners.len(),
             input_handlers_index: self.next_frame.input_handlers.len(),
+            input_focus_handles_index: self.next_frame.input_focus_handles.len(),
             cursor_styles_index: self.next_frame.cursor_styles.len(),
             accessed_element_states_index: self.next_frame.accessed_element_states.len(),
             tab_handle_index: self.next_frame.tab_stops.paint_index(),
@@ -3357,6 +3370,11 @@ impl Window {
                 .iter()
                 .cloned(),
         );
+        self.next_frame.input_focus_handles.extend_from_slice(
+            &self.rendered_frame.input_focus_handles
+                [range.start.input_focus_handles_index..range.end.input_focus_handles_index],
+        );
+
         self.next_frame.input_handlers.extend(
             self.rendered_frame.input_handlers
                 [range.start.input_handlers_index..range.end.input_handlers_index]
@@ -4983,6 +5001,9 @@ impl Window {
     /// rendered.
     ///
     /// This method should only be called as part of the paint phase of element drawing.
+    /// Call it for unfocused inputs too: registration identifies mounted text
+    /// targets for synchronous touch focus requests. Only the focused handler
+    /// is installed on the platform.
     ///
     /// [element_input_handler]: crate::ElementInputHandler
     pub fn handle_input(
@@ -4992,6 +5013,7 @@ impl Window {
         cx: &App,
     ) {
         self.invalidator.debug_assert_paint();
+        self.next_frame.input_focus_handles.push(focus_handle.id);
 
         if focus_handle.is_focused(self) {
             let cx = self.to_async(cx);
@@ -5168,6 +5190,8 @@ impl Window {
     /// Dispatch a mouse or keyboard event on the window.
     #[profiling::function]
     pub fn dispatch_event(&mut self, event: PlatformInput, cx: &mut App) -> DispatchEventResult {
+        let outer_focus_request =
+            std::mem::replace(&mut self.focus_requested_during_dispatch, false);
         #[cfg(feature = "input-latency-histogram")]
         let dispatch_time = Instant::now();
         let update_count_before = self.invalidator.update_count();
@@ -5292,6 +5316,14 @@ impl Window {
                 self.input_latency_tracker.record_mid_draw_input();
             }
         }
+
+        let text_input_focus = self.focus_requested_during_dispatch.then(|| {
+            self.focus
+                .is_some_and(|focus| self.rendered_frame.input_focus_handles.contains(&focus))
+        });
+        self.focus_requested_during_dispatch |= outer_focus_request;
+        self.platform_window
+            .set_text_input_focus_request(text_input_focus);
 
         DispatchEventResult {
             propagate: cx.propagate_event,
@@ -7223,3 +7255,7 @@ mod tests {
         assert_eq!(b_focus_count.get(), 1);
     }
 }
+
+#[cfg(test)]
+#[path = "window_touch_focus_tests.rs"]
+mod touch_focus_tests;
