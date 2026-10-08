@@ -51,6 +51,10 @@ pub(crate) struct DirectXRenderer {
     direct_composition: Option<DirectComposition>,
     /// Deferred GPUI content above native children, once enabled.
     overlay: Option<OverlayPlane>,
+    /// Set once [`Self::enable_overlay`] succeeds. Device-lost recovery
+    /// restores the overlay from this, not from `overlay` — a failed
+    /// recovery attempt has already dropped it before the retry.
+    overlay_requested: bool,
     overlay_generation: u64,
     /// While drawing the overlay: the base frame its backdrop blurs sample,
     /// so frosted popovers blur the UI beneath rather than an empty plane.
@@ -257,6 +261,7 @@ impl DirectXRenderer {
             pipelines,
             direct_composition,
             overlay: None,
+            overlay_requested: false,
             overlay_generation: 0,
             backdrop_source: None,
             font_info: Self::get_font_info(),
@@ -325,7 +330,6 @@ impl DirectXRenderer {
 
     fn handle_device_lost_impl(&mut self, directx_devices: &DirectXDevices) -> Result<()> {
         let disable_direct_composition = self.direct_composition.is_none();
-        let had_overlay = self.overlay.is_some();
 
         unsafe {
             #[cfg(debug_assertions)]
@@ -389,10 +393,11 @@ impl DirectXRenderer {
         self.pipelines = pipelines;
         self.direct_composition = direct_composition;
         self.skip_draws = true;
-        if had_overlay {
+        if self.overlay_requested {
             // Native children were mounted on the lost device; the new
             // generation tells their owners to remount.
-            self.enable_overlay().log_err();
+            self.enable_overlay()
+                .context("Re-enabling the scene overlay")?;
         }
         Ok(())
     }
@@ -426,6 +431,7 @@ impl DirectXRenderer {
             self.height,
             self.hwnd,
         )?);
+        self.overlay_requested = true;
         self.overlay_generation += 1;
         Ok(())
     }

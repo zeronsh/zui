@@ -791,8 +791,12 @@ pub enum TextInputStateChange {
 }
 
 /// Raw composition handles for embedding native surfaces (Windows:
-/// `IDCompositionDevice*` and an `IDCompositionVisual*` layer). Both are
-/// borrowed for the window's lifetime; never release them.
+/// `IDCompositionDevice*` and an `IDCompositionVisual*` layer; `None` on
+/// other platforms). Both are borrowed: never release them, and treat them
+/// as valid only while `generation` is unchanged — GPU device-lost recovery
+/// releases them and creates new ones. Take a reference (`AddRef`) on
+/// anything kept beyond the current frame, and remount native children when
+/// the generation changes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NativeComposition {
     /// The device that owns the layer.
