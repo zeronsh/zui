@@ -24,9 +24,15 @@
 //! * Each window owns one dispatch source for the life of the window. On
 //!   window close it is removed from the registry under the lock (making it
 //!   unreachable from the callback), cancelled, and genuinely released.
-//! * A display's link runs iff it has subscribers; windows never start or
-//!   stop links directly, so interleaved starts/stops of windows sharing a
+//! * A display's link runs while it has subscribers, and for
+//!   [`STOP_LINGER`] after the last one leaves; windows never start or stop
+//!   links directly, so interleaved starts/stops of windows sharing a
 //!   display cannot conflict.
+//! * Every `CVDisplayLinkStart` spawns a fresh io thread. Windows unsubscribe
+//!   whenever frame requests park, which a timer-driven animation (a 30 Hz
+//!   spinner, a blinking caret) does between every frame. Stopping at once
+//!   turned that into a thread spawn per frame; the linger keeps the link
+//!   running across such gaps and still stops it once the window is idle.
 //!
 //! One tradeoff of immortal entries: a link created for a given
 //! `CGDirectDisplayID` is reused forever, including after the display is
@@ -53,7 +59,8 @@
 use anyhow::Result;
 use core_graphics::display::CGDirectDisplayID;
 use dispatch2::{
-    _dispatch_source_type_data_add, DispatchObject, DispatchQueue, DispatchRetained, DispatchSource,
+    _dispatch_source_type_data_add, DispatchObject, DispatchQueue, DispatchRetained,
+    DispatchSource, DispatchTime,
 };
 use gpui_util::ResultExt;
 use std::{
@@ -63,7 +70,14 @@ use std::{
         Arc, Mutex, MutexGuard, PoisonError,
         atomic::{AtomicBool, Ordering},
     },
+    time::Duration,
 };
+
+/// How long a display's link keeps running after its last subscriber leaves.
+/// Long enough to bridge the frame gaps of timer-driven animations (a 15 Hz
+/// spinner parks for ~67 ms between frames), short enough that an idle
+/// window stops waking at the display's refresh rate almost immediately.
+const STOP_LINGER: Duration = Duration::from_millis(250);
 
 static REGISTRY: Mutex<Registry> = Mutex::new(Registry::new());
 
@@ -83,7 +97,7 @@ impl Registry {
 
 struct DisplayEntry {
     link: sys::DisplayLink,
-    running: bool,
+    state: LinkState,
     subscribers: Vec<(
         SubscriberId,
         DispatchRetained<DispatchSource>,
@@ -98,6 +112,50 @@ struct DisplayEntry {
 // `merge_data` from the output callback). All mutation of the entry itself
 // is serialized by the registry lock.
 unsafe impl Send for DisplayEntry {}
+
+/// Whether a display's link is running, and which deferred stop (if any) may
+/// still take effect. Kept free of CoreVideo so the transitions are testable.
+#[derive(Debug, Default)]
+struct LinkState {
+    running: bool,
+    /// Bumped by every subscribe and every last-unsubscribe; a deferred stop
+    /// only applies if no subscribe happened since it was scheduled.
+    stop_generation: u64,
+}
+
+impl LinkState {
+    /// A subscriber joined. Cancels any pending stop; returns whether the
+    /// link must be started (it is marked running either way).
+    fn subscribed(&mut self) -> bool {
+        self.stop_generation += 1;
+        !std::mem::replace(&mut self.running, true)
+    }
+
+    /// Starting the link failed; the next subscriber retries.
+    fn start_failed(&mut self) {
+        self.running = false;
+    }
+
+    /// The last subscriber left. Returns the generation a deferred stop must
+    /// present, or `None` if the link isn't running.
+    fn last_unsubscribed(&mut self) -> Option<u64> {
+        self.running.then(|| {
+            self.stop_generation += 1;
+            self.stop_generation
+        })
+    }
+
+    /// A deferred stop fired. Returns whether the link should stop now (it is
+    /// marked stopped if so).
+    fn deferred_stop(&mut self, generation: u64) -> bool {
+        if self.running && generation == self.stop_generation {
+            self.running = false;
+            true
+        } else {
+            false
+        }
+    }
+}
 
 #[derive(Copy, Clone, PartialEq, Eq)]
 struct SubscriberId(u64);
@@ -176,7 +234,7 @@ fn subscribe(
             (btree_map::Entry::Occupied(entry), _) => entry.into_mut(),
             (btree_map::Entry::Vacant(vacant), Some(link)) => vacant.insert(DisplayEntry {
                 link,
-                running: false,
+                state: LinkState::default(),
                 subscribers: Vec::new(),
             }),
             (btree_map::Entry::Vacant(_), None) => {
@@ -188,14 +246,13 @@ fn subscribe(
         entry
             .subscribers
             .push((subscriber_id, frame_requests, requested));
-        let link_to_start = if entry.running {
-            None
-        } else {
-            entry.running = true;
+        // A link still lingering from its last subscriber is reused as is: no
+        // start, so no new io thread.
+        let link_to_start = entry.state.subscribed().then(|| {
             // Clone the refcounted handle so the CVDisplayLinkStart call can
             // happen after the lock is released.
-            Some(entry.link.clone())
-        };
+            entry.link.clone()
+        });
         (subscriber_id, link_to_start)
     };
 
@@ -203,7 +260,7 @@ fn subscribe(
         if let Err(error) = unsafe { link.start() } {
             let mut registry = lock_registry();
             if let Some(entry) = registry.displays.get_mut(&display_id) {
-                entry.running = false;
+                entry.state.start_failed();
                 entry.subscribers.retain(|(id, _, _)| *id != subscriber_id);
             }
             return Err(error);
@@ -216,18 +273,44 @@ fn subscribe(
 fn unsubscribe(display_id: CGDirectDisplayID, subscriber_id: SubscriberId) {
     debug_assert_main_thread();
 
-    let link_to_stop = {
+    let stop_generation = {
         let mut registry = lock_registry();
         let Some(entry) = registry.displays.get_mut(&display_id) else {
             return;
         };
         entry.subscribers.retain(|(id, _, _)| *id != subscriber_id);
-        if entry.subscribers.is_empty() && entry.running {
-            entry.running = false;
-            Some(entry.link.clone())
+        if entry.subscribers.is_empty() {
+            entry.state.last_unsubscribed()
         } else {
             None
         }
+    };
+
+    // Stop after a linger rather than now (see the module docs). While it
+    // lingers the link's output callback finds no subscribers and does
+    // nothing.
+    if let Some(generation) = stop_generation {
+        let when = DispatchTime::try_from(STOP_LINGER).unwrap_or(DispatchTime::NOW);
+        let scheduled = DispatchQueue::main().after(when, move || {
+            stop_if_still_idle(display_id, generation);
+        });
+        if scheduled.is_err() {
+            stop_if_still_idle(display_id, generation);
+        }
+    }
+}
+
+/// Runs on the main queue once a link has lingered without subscribers.
+fn stop_if_still_idle(display_id: CGDirectDisplayID, generation: u64) {
+    debug_assert_main_thread();
+
+    let link_to_stop = {
+        let mut registry = lock_registry();
+        let Some(entry) = registry.displays.get_mut(&display_id) else {
+            return;
+        };
+        (entry.subscribers.is_empty() && entry.state.deferred_stop(generation))
+            .then(|| entry.link.clone())
     };
 
     if let Some(mut link) = link_to_stop {
@@ -308,6 +391,64 @@ impl Drop for WindowFrameSource {
         // its context points at the window's native view, which may be
         // deallocated after this.
         self.frame_requests.cancel();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LinkState;
+
+    #[test]
+    fn first_subscriber_starts_the_link_once() {
+        let mut state = LinkState::default();
+        assert!(state.subscribed());
+        assert!(!state.subscribed(), "a running link is never started twice");
+    }
+
+    #[test]
+    fn idle_link_stops_after_its_linger() {
+        let mut state = LinkState::default();
+        state.subscribed();
+        let generation = state.last_unsubscribed().unwrap();
+        assert!(state.deferred_stop(generation));
+        assert!(state.subscribed(), "a stopped link starts again");
+    }
+
+    #[test]
+    fn resubscribing_during_the_linger_keeps_the_link_without_a_restart() {
+        let mut state = LinkState::default();
+        state.subscribed();
+        let generation = state.last_unsubscribed().unwrap();
+        assert!(
+            !state.subscribed(),
+            "the lingering link is reused, not restarted"
+        );
+        assert!(
+            !state.deferred_stop(generation),
+            "the stale stop is ignored"
+        );
+        assert!(state.running);
+    }
+
+    #[test]
+    fn only_the_latest_deferred_stop_applies() {
+        let mut state = LinkState::default();
+        state.subscribed();
+        let first = state.last_unsubscribed().unwrap();
+        state.subscribed();
+        let second = state.last_unsubscribed().unwrap();
+        assert!(!state.deferred_stop(first));
+        assert!(state.deferred_stop(second));
+        assert!(!state.deferred_stop(second), "stopping twice is a no-op");
+    }
+
+    #[test]
+    fn a_link_that_never_ran_schedules_no_stop() {
+        let mut state = LinkState::default();
+        assert_eq!(state.last_unsubscribed(), None);
+        state.subscribed();
+        state.start_failed();
+        assert_eq!(state.last_unsubscribed(), None);
     }
 }
 
