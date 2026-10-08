@@ -2915,6 +2915,11 @@ impl Window {
         self.platform_window.enable_scene_overlay()
     }
 
+    /// The composition layer native children mount into, when supported.
+    pub fn native_composition(&self) -> Option<crate::NativeComposition> {
+        self.platform_window.native_composition()
+    }
+
     /// Schedule a native-view update from an element's paint pass. Painting
     /// can run solely to refresh input hit testing, without presenting a frame.
     /// These updates run only when the corresponding scene reaches the screen,

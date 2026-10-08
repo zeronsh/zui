@@ -49,6 +49,16 @@ pub(crate) struct DirectXRenderer {
     globals: DirectXGlobalElements,
     pipelines: DirectXRenderPipelines,
     direct_composition: Option<DirectComposition>,
+    /// Deferred GPUI content above native children, once enabled.
+    overlay: Option<OverlayPlane>,
+    /// Set once [`Self::enable_overlay`] succeeds. Device-lost recovery
+    /// restores the overlay from this, not from `overlay` — a failed
+    /// recovery attempt has already dropped it before the retry.
+    overlay_requested: bool,
+    overlay_generation: u64,
+    /// While drawing the overlay: the base frame its backdrop blurs sample,
+    /// so frosted popovers blur the UI beneath rather than an empty plane.
+    backdrop_source: Option<ID3D11Texture2D>,
     font_info: &'static FontInfo,
 
     width: u32,
@@ -127,6 +137,60 @@ struct DirectComposition {
     comp_visual: IDCompositionVisual,
 }
 
+/// The base swap chain's visual hosts two children: `layer`, where native
+/// surfaces (WebView2) mount, and above it `visual`, a second swap chain for
+/// deferred GPUI content. An empty overlay detaches its content and draws
+/// nothing, so frames without menus cost exactly what they did before.
+struct OverlayPlane {
+    resources: DirectXResources,
+    layer: IDCompositionVisual,
+    visual: IDCompositionVisual,
+    attached: bool,
+}
+
+impl OverlayPlane {
+    fn new(
+        devices: &DirectXRendererDevices,
+        composition: &DirectComposition,
+        width: u32,
+        height: u32,
+        hwnd: HWND,
+    ) -> Result<Self> {
+        let resources = DirectXResources::new(devices, width, height, hwnd, false)
+            .context("Creating overlay resources")?;
+        unsafe {
+            let layer = composition.comp_device.CreateVisual()?;
+            let visual = composition.comp_device.CreateVisual()?;
+            visual.SetContent(&resources.swap_chain)?;
+            composition
+                .comp_visual
+                .AddVisual(&layer, false, None::<&IDCompositionVisual>)?;
+            composition.comp_visual.AddVisual(&visual, true, &layer)?;
+            composition.comp_device.Commit()?;
+            Ok(Self {
+                resources,
+                layer,
+                visual,
+                attached: true,
+            })
+        }
+    }
+
+    fn set_attached(&mut self, attached: bool) -> Result<()> {
+        if self.attached != attached {
+            unsafe {
+                if attached {
+                    self.visual.SetContent(&self.resources.swap_chain)?;
+                } else {
+                    self.visual.SetContent(None::<&windows::core::IUnknown>)?;
+                }
+            }
+            self.attached = attached;
+        }
+        Ok(())
+    }
+}
+
 impl DirectXRendererDevices {
     pub(crate) fn new(
         directx_devices: &DirectXDevices,
@@ -196,6 +260,10 @@ impl DirectXRenderer {
             globals,
             pipelines,
             direct_composition,
+            overlay: None,
+            overlay_requested: false,
+            overlay_generation: 0,
+            backdrop_source: None,
             font_info: Self::get_font_info(),
             width: 1,
             height: 1,
@@ -272,6 +340,7 @@ impl DirectXRenderer {
             }
 
             self.resources.take();
+            self.overlay.take();
             if let Some(devices) = &self.devices {
                 devices.device_context.OMSetRenderTargets(None, None);
                 devices.device_context.ClearState();
@@ -324,6 +393,12 @@ impl DirectXRenderer {
         self.pipelines = pipelines;
         self.direct_composition = direct_composition;
         self.skip_draws = true;
+        if self.overlay_requested {
+            // Native children were mounted on the lost device; the new
+            // generation tells their owners to remount.
+            self.enable_overlay()
+                .context("Re-enabling the scene overlay")?;
+        }
         Ok(())
     }
 
@@ -337,6 +412,105 @@ impl DirectXRenderer {
         }
         self.draw_scene(scene, background_appearance)?;
         self.present()
+    }
+
+    /// Create the native layer and overlay plane (idempotent).
+    pub(crate) fn enable_overlay(&mut self) -> Result<()> {
+        if self.overlay.is_some() {
+            return Ok(());
+        }
+        let composition = self
+            .direct_composition
+            .as_ref()
+            .context("Native scene overlays require DirectComposition")?;
+        let devices = self.devices.as_ref().context("devices missing")?;
+        self.overlay = Some(OverlayPlane::new(
+            devices,
+            composition,
+            self.width,
+            self.height,
+            self.hwnd,
+        )?);
+        self.overlay_requested = true;
+        self.overlay_generation += 1;
+        Ok(())
+    }
+
+    pub(crate) fn has_overlay(&self) -> bool {
+        self.overlay.is_some()
+    }
+
+    pub(crate) fn native_composition(&self) -> Option<NativeComposition> {
+        let composition = self.direct_composition.as_ref()?;
+        let overlay = self.overlay.as_ref()?;
+        Some(NativeComposition {
+            device: composition.comp_device.as_raw(),
+            layer: overlay.layer.as_raw(),
+            generation: self.overlay_generation,
+        })
+    }
+
+    /// Draw `scene[..overlay_start]` beneath native children and the rest
+    /// above them. Without deferred content the scene is drawn as-is (no
+    /// copy) and the overlay stays detached. Commits native-layer geometry
+    /// that presentation callbacks changed for this frame.
+    pub(crate) fn draw_layered(
+        &mut self,
+        scene: &Scene,
+        overlay_start: usize,
+        background_appearance: WindowBackgroundAppearance,
+    ) -> Result<()> {
+        if self.overlay.is_none() {
+            return self.draw(scene, background_appearance);
+        }
+        if self.skip_draws {
+            return Ok(());
+        }
+        let split = overlay_start.min(scene.len());
+        if split == scene.len() {
+            self.draw_scene(scene, background_appearance)?;
+            self.present()?;
+            self.overlay.as_mut().unwrap().set_attached(false)?;
+        } else {
+            let mut base = Scene::default();
+            base.replay(0..split, scene);
+            base.finish();
+            let mut overlay = Scene::default();
+            overlay.replay(split..scene.len(), scene);
+            overlay.finish();
+            self.draw_scene(&base, background_appearance)?;
+            // Present the base after the overlay is drawn: its back buffer
+            // is the overlay's blur source until then.
+            if !overlay.backdrop_blurs.is_empty() {
+                self.backdrop_source = self
+                    .resources
+                    .as_ref()
+                    .and_then(|resources| resources.render_target.clone());
+            }
+            // The overlay shares devices, pipelines and the atlas; only its
+            // swap chain and render targets differ.
+            self.swap_overlay_resources();
+            let drawn = self
+                .draw_scene(&overlay, WindowBackgroundAppearance::Transparent)
+                .and_then(|_| self.present());
+            self.swap_overlay_resources();
+            self.backdrop_source = None;
+            drawn?;
+            self.present()?;
+            self.overlay.as_mut().unwrap().set_attached(true)?;
+        }
+        if let Some(composition) = &self.direct_composition {
+            unsafe { composition.comp_device.Commit()? };
+        }
+        Ok(())
+    }
+
+    fn swap_overlay_resources(&mut self) {
+        let overlay = self.overlay.as_mut().expect("overlay missing");
+        std::mem::swap(
+            self.resources.as_mut().expect("resources missing"),
+            &mut overlay.resources,
+        );
     }
 
     // Kept separate from presentation so WARP tests can read the actual frame.
@@ -441,7 +615,27 @@ impl DirectXRenderer {
         // Clear the render target before resizing
         let devices = self.devices.as_ref().context("devices missing")?;
         unsafe { devices.device_context.OMSetRenderTargets(None, None) };
+        if let Some(overlay) = self.overlay.as_mut() {
+            Self::resize_resources(devices, &mut overlay.resources, width, height)?;
+        }
         let resources = self.resources.as_mut().context("resources missing")?;
+        Self::resize_resources(devices, resources, width, height)?;
+
+        unsafe {
+            devices
+                .device_context
+                .OMSetRenderTargets(Some(slice::from_ref(&resources.render_target_view)), None);
+        }
+
+        Ok(())
+    }
+
+    fn resize_resources(
+        devices: &DirectXRendererDevices,
+        resources: &mut DirectXResources,
+        width: u32,
+        height: u32,
+    ) -> Result<()> {
         resources.backdrop = None;
         resources.render_target.take();
         resources.render_target_view.take();
@@ -463,15 +657,7 @@ impl DirectXRenderer {
                 .context("Failed to resize swap chain")?;
         }
 
-        resources.recreate_resources(devices, width, height)?;
-
-        unsafe {
-            devices
-                .device_context
-                .OMSetRenderTargets(Some(slice::from_ref(&resources.render_target_view)), None);
-        }
-
-        Ok(())
+        resources.recreate_resources(devices, width, height)
     }
 
     fn upload_scene_buffers(&mut self, scene: &Scene) -> Result<()> {
