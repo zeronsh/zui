@@ -526,6 +526,12 @@ struct EdgeFadeParams {
     right_x: f32,
     band_left: f32,
     band_right: f32,
+    clip_left: f32,
+    clip_top: f32,
+    clip_right: f32,
+    clip_bottom: f32,
+    clip_radius: f32,
+    clip_pad: f32,
 }
 
 // Per-pixel scoped edge fade — squared ramp, matching the CPU per-glyph
@@ -544,7 +550,18 @@ fn edge_fade_alpha(position: vec2<f32>, fade: EdgeFadeParams) -> f32 {
     if (fade.band_right > 0.0) {
         ramp = min(ramp, clamp((fade.right_x - position.x) / fade.band_right, 0.0, 1.0));
     }
-    return ramp * ramp;
+    var alpha = ramp * ramp;
+    if (fade.clip_right > fade.clip_left) {
+        // Rounded-rectangle clip: signed distance to the scope's edge, with
+        // a one-pixel antialiased transition.
+        let half_size = vec2<f32>(fade.clip_right - fade.clip_left, fade.clip_bottom - fade.clip_top) * 0.5;
+        let center = vec2<f32>(fade.clip_left, fade.clip_top) + half_size;
+        let radius = min(fade.clip_radius, min(half_size.x, half_size.y));
+        let q = abs(position - center) - half_size + vec2<f32>(radius);
+        let distance = length(max(q, vec2<f32>(0.0))) + min(max(q.x, q.y), 0.0) - radius;
+        alpha = alpha * clamp(0.5 - distance, 0.0, 1.0);
+    }
+    return alpha;
 }
 
 struct Quad {

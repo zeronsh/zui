@@ -72,9 +72,9 @@ mod tests {
     }
 
     #[test]
-    fn edge_fade_layout_is_eight_packed_floats() {
+    fn edge_fade_layout_is_fourteen_packed_floats() {
         assert_eq!(align_of::<EdgeFadeParams>(), align_of::<f32>());
-        assert_eq!(size_of::<EdgeFadeParams>(), 32);
+        assert_eq!(size_of::<EdgeFadeParams>(), 56);
         assert_fields_in_order(
             hlsl_struct("EdgeFadeParams"),
             &[
@@ -86,6 +86,12 @@ mod tests {
                 "float right_x;",
                 "float band_left;",
                 "float band_right;",
+                "float clip_left;",
+                "float clip_top;",
+                "float clip_right;",
+                "float clip_bottom;",
+                "float clip_radius;",
+                "float clip_pad;",
             ],
         );
     }
@@ -93,7 +99,7 @@ mod tests {
     #[test]
     fn quad_hlsl_layout_includes_trailing_edge_fade() {
         assert_eq!(offset_of!(Quad, fade), 160);
-        assert_eq!(size_of::<Quad>(), 192);
+        assert_eq!(size_of::<Quad>(), 216);
         assert_fields_in_order(
             hlsl_struct("Quad"),
             &[
@@ -113,10 +119,10 @@ mod tests {
     #[test]
     fn polychrome_hlsl_layout_keeps_fade_before_atlas_tile() {
         assert_eq!(offset_of!(PolychromeSprite, fade), 64);
-        assert_eq!(offset_of!(PolychromeSprite, alpha_mask), 96);
-        assert_eq!(offset_of!(PolychromeSprite, tile), 136);
+        assert_eq!(offset_of!(PolychromeSprite, alpha_mask), 120);
+        assert_eq!(offset_of!(PolychromeSprite, tile), 160);
         assert_eq!(size_of::<AtlasTile>(), 32);
-        assert_eq!(size_of::<PolychromeSprite>(), 168);
+        assert_eq!(size_of::<PolychromeSprite>(), 192);
         assert_fields_in_order(
             hlsl_struct("PolychromeSprite"),
             &[

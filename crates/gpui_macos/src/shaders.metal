@@ -1278,7 +1278,18 @@ float edge_fade_alpha(float2 position, EdgeFadeParams fade) {
   if (fade.band_right > 0.0) {
     ramp = min(ramp, clamp((fade.right_x - position.x) / fade.band_right, 0.0, 1.0));
   }
-  return ramp * ramp;
+  float alpha = ramp * ramp;
+  if (fade.clip_right > fade.clip_left) {
+    // Rounded-rectangle clip: signed distance to the scope's edge, with a
+    // one-pixel antialiased transition.
+    float2 half_size = float2(fade.clip_right - fade.clip_left, fade.clip_bottom - fade.clip_top) * 0.5;
+    float2 center = float2(fade.clip_left, fade.clip_top) + half_size;
+    float radius = min(fade.clip_radius, min(half_size.x, half_size.y));
+    float2 q = abs(position - center) - half_size + radius;
+    float distance = length(max(q, float2(0.0))) + min(max(q.x, q.y), 0.0) - radius;
+    alpha *= saturate(0.5 - distance);
+  }
+  return alpha;
 }
 
 float4 fill_color(Background background,

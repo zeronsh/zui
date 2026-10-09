@@ -593,6 +593,12 @@ impl PrimitiveBatch {
 /// window-space edges (device pixels) — a TRUE per-pixel fade, so large
 /// fills and images dissolve across the band instead of popping at their
 /// bounding-box edge. A zero band disables that edge; zeroed = no fade.
+///
+/// The same block carries the scoped rounded clip (see
+/// `Window::with_rounded_clip`): fragments outside the rounded rectangle
+/// `clip_left..clip_right` × `clip_top..clip_bottom` with `clip_radius`
+/// corners are dropped with an antialiased edge. Inactive while
+/// `clip_right <= clip_left` (zeroed).
 #[derive(Default, Debug, Copy, Clone, PartialEq)]
 #[repr(C)]
 #[expect(missing_docs)]
@@ -605,6 +611,13 @@ pub struct EdgeFadeParams {
     pub right_x: f32,
     pub band_left: f32,
     pub band_right: f32,
+    pub clip_left: f32,
+    pub clip_top: f32,
+    pub clip_right: f32,
+    pub clip_bottom: f32,
+    pub clip_radius: f32,
+    /// Keeps the struct's size a multiple of 8 bytes for the WGSL mirror.
+    pub clip_pad: f32,
 }
 
 #[derive(Default, Debug, Copy, Clone)]

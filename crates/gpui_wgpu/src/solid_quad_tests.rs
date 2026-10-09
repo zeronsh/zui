@@ -160,6 +160,7 @@ fn compare_shader_pixels(include_interiors: bool) {
                     band_bottom: 30.5,
                     band_left: 13.5,
                     band_right: 20.75,
+                    ..Default::default()
                 };
             }
             quads.push(q);

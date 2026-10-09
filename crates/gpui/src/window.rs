@@ -1085,6 +1085,8 @@ pub struct Window {
     pub(crate) element_offset_stack: Vec<Point<Pixels>>,
     pub(crate) element_opacity: f32,
     pub(crate) edge_fade: Option<EdgeFade>,
+    /// The active [`Window::with_rounded_clip`] scope: bounds and radius.
+    pub(crate) rounded_clip: Option<(Bounds<Pixels>, Pixels)>,
     pub(crate) content_mask_stack: Vec<ContentMask<Pixels>>,
     pub(crate) requested_autoscroll: Option<Bounds<Pixels>>,
     pub(crate) image_cache_stack: Vec<AnyImageCache>,
@@ -1807,6 +1809,7 @@ impl Window {
             content_mask_stack: Vec::new(),
             element_opacity: 1.0,
             edge_fade: None,
+            rounded_clip: None,
             requested_autoscroll: None,
             rendered_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
             next_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
@@ -3705,19 +3708,30 @@ impl Window {
         opacity * ramp * ramp
     }
 
-    /// The active [`EdgeFade`] scope as device-pixel shader params
-    /// ([`crate::EdgeFadeParams`]) — zeroed when no scope (or no active
-    /// edge) exists. Quads and polychrome sprites carry these into the
-    /// fragment shader for a TRUE per-pixel fade, all four edges (glyphs
-    /// keep their CPU-side per-glyph curve).
+    /// The active [`EdgeFade`] and rounded-clip scopes as device-pixel
+    /// shader params ([`crate::EdgeFadeParams`]) — zeroed when neither
+    /// exists. Quads, sprites and glyphs carry these into the fragment
+    /// shader for a TRUE per-pixel fade and clip.
     fn scaled_edge_fade(&self) -> crate::EdgeFadeParams {
+        let scale = self.scale_factor();
+        let mut params = self.scaled_fade_ramp(scale);
+        if let Some((bounds, radius)) = self.rounded_clip {
+            params.clip_left = bounds.left().0 * scale;
+            params.clip_top = bounds.top().0 * scale;
+            params.clip_right = bounds.right().0 * scale;
+            params.clip_bottom = bounds.bottom().0 * scale;
+            params.clip_radius = radius.0 * scale;
+        }
+        params
+    }
+
+    fn scaled_fade_ramp(&self, scale: f32) -> crate::EdgeFadeParams {
         let Some(fade) = &self.edge_fade else {
             return Default::default();
         };
         if !(fade.top || fade.bottom || fade.left || fade.right) {
             return Default::default();
         }
-        let scale = self.scale_factor();
         crate::EdgeFadeParams {
             top_y: fade.bounds.top().0 * scale,
             bottom_y: fade.bounds.bottom().0 * scale,
@@ -3743,7 +3757,29 @@ impl Window {
             } else {
                 0.0
             },
+            ..Default::default()
         }
+    }
+
+    /// Executes `f` with painting clipped to `bounds` with rounded corners
+    /// of `radius`: the rectangular content mask is narrowed to `bounds`,
+    /// and quads, glyphs, images and SVG icons are additionally clipped to
+    /// the rounded corners per pixel, with an antialiased edge. Content
+    /// scrolling inside a rounded card then never shows past its corners —
+    /// which a painted corner cover can't do over a translucent backdrop.
+    /// Paths, underlines and shadows keep the rectangular clip only. The
+    /// innermost scope wins; it composes with [`Self::with_edge_fade`].
+    pub fn with_rounded_clip<R>(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        radius: Pixels,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.invalidator.debug_assert_paint_or_prepaint();
+        let previous = self.rounded_clip.replace((bounds, radius));
+        let result = self.with_content_mask(Some(ContentMask { bounds }), f);
+        self.rounded_clip = previous;
+        result
     }
 
     /// Obtain the current content mask. This method should only be called during element drawing.

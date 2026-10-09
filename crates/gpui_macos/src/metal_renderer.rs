@@ -2500,6 +2500,73 @@ mod backdrop_blur_tests {
     }
 
     #[test]
+    fn rounded_clip_cuts_corners_with_an_antialiased_edge() {
+        assert!(
+            metal::Device::system_default().is_some(),
+            "requires Metal GPU"
+        );
+        let mut renderer =
+            MetalRenderer::new_headless(Arc::new(Mutex::new(InstanceBufferPool::default())));
+        // A white quad over the whole view, clipped to a 40x40 rounded
+        // rectangle at (10, 10) with 12px corners, on a black backdrop.
+        let mut paint = |clip: bool| {
+            let mut scene = Scene::default();
+            push_quad(&mut scene, viewport(), 0.0);
+            scene.insert_primitive(Quad {
+                order: 0,
+                border_style: Default::default(),
+                bounds: viewport(),
+                content_mask: ContentMask { bounds: viewport() },
+                background: solid_background(Hsla {
+                    h: 0.,
+                    s: 0.,
+                    l: 1.,
+                    a: 1.,
+                }),
+                border_color: transparent_black(),
+                corner_radii: Corners::default(),
+                border_widths: Edges::default(),
+                fade: if clip {
+                    gpui::EdgeFadeParams {
+                        clip_left: 10.,
+                        clip_top: 10.,
+                        clip_right: 50.,
+                        clip_bottom: 50.,
+                        clip_radius: 12.,
+                        ..Default::default()
+                    }
+                } else {
+                    gpui::EdgeFadeParams::default()
+                },
+            });
+            scene.finish();
+            renderer
+                .render_scene_to_image(&scene, size(DevicePixels(VIEW_W), DevicePixels(VIEW_H)))
+                .unwrap()
+        };
+        let unclipped = paint(false);
+        assert_eq!(unclipped.get_pixel(5, 5)[0], 255, "a zeroed clip is a no-op");
+        let clipped = paint(true);
+        // Outside the rectangle, and inside its bounds but past a corner arc.
+        assert_eq!(clipped.get_pixel(5, 30)[0], 0);
+        assert_eq!(clipped.get_pixel(10, 10)[0], 0);
+        assert_eq!(clipped.get_pixel(49, 49)[0], 0);
+        // Straight edges and the body are untouched.
+        assert_eq!(clipped.get_pixel(30, 30)[0], 255);
+        assert_eq!(clipped.get_pixel(11, 30)[0], 255);
+        assert_eq!(clipped.get_pixel(30, 48)[0], 255);
+        // Along the arc the edge is antialiased, not stair-stepped: some
+        // pixel on the 45° diagonal is partially covered.
+        assert!(
+            (10..20).any(|i| {
+                let value = clipped.get_pixel(i, i)[0];
+                value > 0 && value < 255
+            }),
+            "the corner arc has a soft edge"
+        );
+    }
+
+    #[test]
     fn monochrome_fade_varies_within_a_glyph_and_moves_continuously() {
         use gpui::{
             EdgeFadeParams, MonochromeSprite, PlatformAtlas, RenderSvgParams, TransformationMatrix,
