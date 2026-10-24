@@ -29,6 +29,7 @@ static BUNDLED_FONTS: &[&[u8]] = &[
     include_bytes!("../../../assets/fonts/lilex/Lilex-Bold.ttf"),
     include_bytes!("../../../assets/fonts/lilex/Lilex-Italic.ttf"),
     include_bytes!("../../../assets/fonts/lilex/Lilex-BoldItalic.ttf"),
+    include_bytes!("../../../assets/fonts/twemoji-mozilla/Twemoji.Mozilla.ttf"),
 ];
 
 pub struct WebPlatform {
@@ -37,6 +38,7 @@ pub struct WebPlatform {
     foreground_executor: ForegroundExecutor,
     text_system: Arc<dyn PlatformTextSystem>,
     active_window: RefCell<Option<AnyWindowHandle>>,
+    clipboard: Rc<RefCell<Option<ClipboardItem>>>,
     active_display: Rc<dyn PlatformDisplay>,
     callbacks: RefCell<WebPlatformCallbacks>,
     wgpu_context: Rc<RefCell<Option<WgpuContext>>>,
@@ -95,6 +97,7 @@ impl WebPlatform {
             foreground_executor,
             text_system,
             active_window: RefCell::new(None),
+            clipboard: Rc::new(RefCell::new(None)),
             active_display,
             callbacks: RefCell::new(WebPlatformCallbacks::default()),
             wgpu_context: Rc::new(RefCell::new(None)),
@@ -177,7 +180,13 @@ impl Platform for WebPlatform {
             anyhow::anyhow!("WebGPU context not initialized. Was Platform::run() called?")
         })?;
 
-        let window = WebWindow::new(handle, params, context, self.browser_window.clone())?;
+        let window = WebWindow::new(
+            handle,
+            params,
+            context,
+            self.browser_window.clone(),
+            self.clipboard.clone(),
+        )?;
         *self.active_window.borrow_mut() = Some(handle);
         Ok(Box::new(window))
     }
@@ -339,7 +348,7 @@ impl Platform for WebPlatform {
     }
 
     fn read_from_clipboard(&self) -> Option<ClipboardItem> {
-        None
+        self.clipboard.borrow().clone()
     }
 
     fn write_to_clipboard(&self, item: ClipboardItem) {
