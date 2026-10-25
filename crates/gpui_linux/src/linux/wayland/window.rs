@@ -841,6 +841,10 @@ impl WaylandWindowStatePtr {
     pub fn frame(&self) {
         let mut state = self.state.borrow_mut();
         state.surface.frame(&state.globals.qh, state.surface.id());
+        // Only a present in this frame commits that request: one made outside
+        // the frame loop (a forced draw) must not stop the next commit, or the
+        // compositor never answers and frames stop.
+        state.renderer_presented = false;
         state.resize_throttle = false;
         let force_render = state.force_render_after_recovery;
         state.force_render_after_recovery = false;

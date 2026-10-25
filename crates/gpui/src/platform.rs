@@ -1314,6 +1314,104 @@ impl From<RenderImageParams> for AtlasKey {
     }
 }
 
+/// New pixels for a region of a tile the atlas already holds.
+pub enum AtlasTileUpdate<'a> {
+    /// BGRA8 rows for the region, `bytes_per_row` apart. The atlas copies them
+    /// before returning.
+    Pixels {
+        /// The first row of the region; later rows follow `bytes_per_row` apart.
+        bytes: &'a [u8],
+        /// Distance between the starts of two rows.
+        bytes_per_row: u32,
+    },
+    /// A dma-buf imported with [`PlatformAtlas::import_dmabuf`]. The GPU copies
+    /// the region whose top-left pixel in the buffer is `origin`.
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    Dmabuf {
+        /// The imported buffer.
+        buffer: DmabufId,
+        /// Where the region starts in the buffer, in pixels.
+        origin: Point<DevicePixels>,
+    },
+}
+
+/// Identifies a dma-buf imported into the GPU device behind an atlas.
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct DmabufId(pub u64);
+
+/// A dma-buf imported with [`crate::Window::import_dmabuf`]. Dropping it, on
+/// any thread, releases the import once no queued copy reads it anymore.
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+pub struct DmabufImport {
+    id: DmabufId,
+    release: Option<Box<dyn FnOnce() + Send>>,
+}
+
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+impl DmabufImport {
+    /// For atlases: an import named `id` that runs `release` when dropped.
+    pub fn new(id: DmabufId, release: impl FnOnce() + Send + 'static) -> Self {
+        Self {
+            id,
+            release: Some(Box::new(release)),
+        }
+    }
+
+    /// The buffer to name in [`AtlasTileUpdate::Dmabuf`].
+    pub fn id(&self) -> DmabufId {
+        self.id
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+impl Drop for DmabufImport {
+    fn drop(&mut self) {
+        if let Some(release) = self.release.take() {
+            release();
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+impl std::fmt::Debug for DmabufImport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("DmabufImport").field(&self.id).finish()
+    }
+}
+
+/// A single-plane dma-buf another process rendered into.
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[derive(Debug)]
+pub struct Dmabuf<'a> {
+    /// The dma-buf file descriptor. Importing duplicates it.
+    pub fd: std::os::fd::BorrowedFd<'a>,
+    /// Width in pixels.
+    pub width: u32,
+    /// Height in pixels.
+    pub height: u32,
+    /// The DRM fourcc of the pixels, e.g. `AR24`.
+    pub fourcc: u32,
+    /// The DRM format modifier, which says how the pixels are laid out:
+    /// linear, or one of the GPU's tiled layouts.
+    pub modifier: u64,
+    /// Byte offset of the first pixel.
+    pub offset: u32,
+    /// Distance between the starts of two rows.
+    pub stride: u32,
+}
+
+/// Where a producer should render for an atlas to import its dma-bufs without
+/// copies.
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DmabufTarget {
+    /// The DRM render node of the GPU the atlas lives on.
+    pub render_node: std::path::PathBuf,
+    /// The format modifiers of the `AR24` dma-bufs the atlas can import.
+    pub modifiers: Vec<u64>,
+}
+
 #[expect(missing_docs)]
 pub trait PlatformAtlas {
     fn get_or_insert_with<'a>(
@@ -1322,6 +1420,48 @@ pub trait PlatformAtlas {
         build: &mut dyn FnMut() -> Result<Option<(Size<DevicePixels>, Cow<'a, [u8]>)>>,
     ) -> Result<Option<AtlasTile>>;
     fn remove(&self, key: &AtlasKey);
+
+    /// Allocates a tile for `key` without uploading anything, for content that
+    /// only arrives through [`Self::update_tile`]. Returns whether the tile is
+    /// new, its content undefined, or `None` when this atlas cannot do that.
+    fn insert_blank(&self, _key: &AtlasKey, _size: Size<DevicePixels>) -> Result<Option<bool>> {
+        Ok(None)
+    }
+
+    /// Overwrites `region`, in tile-local device pixels, of the tile cached for
+    /// `key`. `on_complete` runs exactly once, on any thread and never with the
+    /// atlas locked, errors included: once the GPU finished all work queued
+    /// before it, so it no longer reads this update's source nor any earlier
+    /// one. Updates land in the order queued, except that pixels land before
+    /// the frame's dma-buf copies, dropping those they cover: a producer that
+    /// switches from copies to pixels updates the whole tile. Returns
+    /// `Ok(false)` when no tile is cached for `key` or this atlas cannot update
+    /// tiles in place; the caller then paints a whole new image instead.
+    fn update_tile(
+        &self,
+        _key: &AtlasKey,
+        _region: Bounds<DevicePixels>,
+        _update: AtlasTileUpdate<'_>,
+        on_complete: Option<Box<dyn FnOnce() + Send>>,
+    ) -> Result<bool> {
+        if let Some(complete) = on_complete {
+            complete();
+        }
+        Ok(false)
+    }
+
+    /// The GPU this atlas lives on and the dma-bufs it can import, for
+    /// producers that should render where their frames need no copies.
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    fn dmabuf_target(&self) -> Option<DmabufTarget> {
+        None
+    }
+
+    /// Imports a dma-buf for [`AtlasTileUpdate::Dmabuf`] copies.
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    fn import_dmabuf(&self, _dmabuf: &Dmabuf<'_>) -> Result<DmabufImport> {
+        bail!("this renderer cannot import dma-bufs")
+    }
 }
 
 #[doc(hidden)]

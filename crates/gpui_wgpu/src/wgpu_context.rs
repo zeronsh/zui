@@ -158,19 +158,27 @@ impl WgpuContext {
 
         let color_atlas_texture_format = Self::select_color_texture_format(adapter)?;
 
-        let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor {
-                label: Some("gpui_device"),
-                required_features,
-                required_limits: wgpu::Limits::downlevel_defaults()
-                    .using_resolution(adapter.limits())
-                    .using_alignment(adapter.limits()),
-                memory_hints: wgpu::MemoryHints::MemoryUsage,
-                trace: wgpu::Trace::Off,
-                experimental_features: wgpu::ExperimentalFeatures::disabled(),
-            })
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to create wgpu device: {e}"))?;
+        let descriptor = wgpu::DeviceDescriptor {
+            label: Some("gpui_device"),
+            required_features,
+            required_limits: wgpu::Limits::downlevel_defaults()
+                .using_resolution(adapter.limits())
+                .using_alignment(adapter.limits()),
+            memory_hints: wgpu::MemoryHints::MemoryUsage,
+            trace: wgpu::Trace::Off,
+            experimental_features: wgpu::ExperimentalFeatures::disabled(),
+        };
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+        let opened = crate::dmabuf::request_device(adapter, &descriptor);
+        #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+        let opened = None;
+        let (device, queue) = match opened {
+            Some(opened) => opened,
+            None => adapter
+                .request_device(&descriptor)
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to create wgpu device: {e}"))?,
+        };
 
         Ok((
             device,

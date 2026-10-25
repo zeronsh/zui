@@ -1096,6 +1096,9 @@ pub struct Window {
     pub(crate) next_tooltip_id: TooltipId,
     pub(crate) tooltip_bounds: Option<TooltipBounds>,
     next_frame_callbacks: Rc<RefCell<Vec<FrameCallback>>>,
+    /// A pending next-frame callback follows the display: see
+    /// [`Window::on_next_display_frame`].
+    display_frame_requested: Rc<Cell<bool>>,
     pub(crate) dirty_views: FxHashSet<EntityId>,
     focus_listeners: SubscriberSet<(), AnyWindowFocusListener>,
     pub(crate) focus_lost_listeners: SubscriberSet<(), AnyObserver>,
@@ -1435,6 +1438,7 @@ impl Window {
         let hovered = Rc::new(Cell::new(platform_window.is_hovered()));
         let needs_present = Rc::new(Cell::new(false));
         let next_frame_callbacks: Rc<RefCell<Vec<FrameCallback>>> = Default::default();
+        let display_frame_requested = Rc::new(Cell::new(false));
         let input_rate_tracker = Rc::new(RefCell::new(InputRateTracker::default()));
         let last_frame_time = Rc::new(Cell::new(None));
 
@@ -1548,6 +1552,7 @@ impl Window {
             let active = active.clone();
             let needs_present = needs_present.clone();
             let next_frame_callbacks = next_frame_callbacks.clone();
+            let display_frame_requested = display_frame_requested.clone();
             let input_rate_tracker = input_rate_tracker.clone();
             move |request_frame_options| {
                 let thermal_state = handle
@@ -1556,13 +1561,14 @@ impl Window {
 
                 // Throttle frame rate based on conditions:
                 // - Thermal pressure (Serious/Critical): cap to ~60fps
-                // - Inactive window (not focused): cap to ~30fps to save energy
+                // - Inactive window (not focused): cap to ~30fps to save energy,
+                //   unless content following the display asked for this frame
                 let min_frame_interval = if !request_frame_options.force_render
                     && !request_frame_options.require_presentation
                     && next_frame_callbacks.borrow().is_empty()
                 {
                     None
-                } else if !active.get() {
+                } else if !active.get() && !display_frame_requested.get() {
                     Some(Duration::from_micros(33333))
                 } else if let Some(ThermalState::Critical | ThermalState::Serious) = thermal_state {
                     Some(Duration::from_micros(16667))
@@ -1588,6 +1594,7 @@ impl Window {
                 last_frame_time.set(Some(now));
 
                 let next_frame_callbacks = next_frame_callbacks.take();
+                display_frame_requested.set(false);
                 if !next_frame_callbacks.is_empty() {
                     handle
                         .update(&mut cx, |_, window, cx| {
@@ -1814,6 +1821,7 @@ impl Window {
             rendered_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
             next_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
             next_frame_callbacks,
+            display_frame_requested,
             next_hitbox_id: HitboxId(0),
             next_tooltip_id: TooltipId::default(),
             tooltip_bounds: None,
@@ -2304,6 +2312,14 @@ impl Window {
         self.invalidator.request_frame();
     }
 
+    /// Like [`Self::on_next_frame`], for content that follows the display, such
+    /// as video or a web page: an inactive window, which otherwise slows its
+    /// frames to save energy, keeps the display's rate for this callback.
+    pub fn on_next_display_frame(&self, callback: impl FnOnce(&mut Window, &mut App) + 'static) {
+        self.display_frame_requested.set(true);
+        self.on_next_frame(callback);
+    }
+
     /// Schedule a frame to be drawn on the next animation frame.
     ///
     /// This is useful for elements that need to animate continuously, such as a video player or an animated GIF.
@@ -2328,6 +2344,7 @@ impl Window {
     #[cfg(any(test, feature = "test-support"))]
     pub fn simulate_next_frame(&mut self, cx: &mut App) -> usize {
         let callbacks = self.next_frame_callbacks.take();
+        self.display_frame_requested.set(false);
         let count = callbacks.len();
         for callback in callbacks {
             callback(self, cx);
@@ -3659,8 +3676,8 @@ impl Window {
                 .min(((fade.bounds.bottom().0 - center.y.0) / fade.bottom_band()).clamp(0.0, 1.0));
         }
         if fade.left {
-            ramp = ramp
-                .min(((center.x.0 - fade.bounds.left().0) / fade.left_band()).clamp(0.0, 1.0));
+            ramp =
+                ramp.min(((center.x.0 - fade.bounds.left().0) / fade.left_band()).clamp(0.0, 1.0));
         }
         if fade.right {
             ramp = ramp
@@ -4836,6 +4853,71 @@ impl Window {
         }
 
         Ok(())
+    }
+
+    /// Overwrites a region of an image already painted with
+    /// [`Self::paint_image`], so a producer that tracks damage uploads only what
+    /// changed; a [`RenderImage::blank`] image gets its tile from
+    /// [`Self::insert_blank_image`] instead. Returns `Ok(false)` when the image
+    /// has no tile (or the renderer cannot update in place); paint a complete
+    /// image instead. `on_complete` runs exactly once, as
+    /// [`PlatformAtlas::update_tile`] describes.
+    pub fn update_image(
+        &mut self,
+        data: &RenderImage,
+        frame_index: usize,
+        region: Bounds<DevicePixels>,
+        update: crate::AtlasTileUpdate<'_>,
+        on_complete: Option<Box<dyn FnOnce() + Send>>,
+    ) -> Result<bool> {
+        let key: crate::AtlasKey = RenderImageParams {
+            image_id: data.id,
+            frame_index,
+        }
+        .into();
+        self.sprite_atlas
+            .update_tile(&key, region, update, on_complete)
+    }
+
+    /// Allocates the tile of a [`RenderImage::blank`] image without uploading
+    /// its blank pixels. Returns whether the tile is new: its content is
+    /// undefined until [`Self::update_image`] fills all of it. An atlas can drop
+    /// tiles (a lost GPU), so call this before each round of updates.
+    pub fn insert_blank_image(&mut self, data: &RenderImage, frame_index: usize) -> Result<bool> {
+        let key: crate::AtlasKey = RenderImageParams {
+            image_id: data.id,
+            frame_index,
+        }
+        .into();
+        match self.sprite_atlas.insert_blank(&key, data.size(frame_index))? {
+            Some(created) => Ok(created),
+            // Upload the blank pixels instead.
+            None => {
+                let size = data.size(frame_index);
+                let bytes = data
+                    .as_bytes(frame_index)
+                    .ok_or_else(|| anyhow!("image has no frame {frame_index}"))?;
+                let mut created = false;
+                self.sprite_atlas.get_or_insert_with(&key, &mut || {
+                    created = true;
+                    Ok(Some((size, Cow::Borrowed(bytes))))
+                })?;
+                Ok(created)
+            }
+        }
+    }
+
+    /// The GPU this window renders on and the dma-bufs it can import.
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    pub fn dmabuf_target(&self) -> Option<crate::DmabufTarget> {
+        self.sprite_atlas.dmabuf_target()
+    }
+
+    /// Imports a dma-buf for [`crate::AtlasTileUpdate::Dmabuf`] updates of this
+    /// window's images, until the returned import is dropped.
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    pub fn import_dmabuf(&self, dmabuf: &crate::Dmabuf<'_>) -> Result<crate::DmabufImport> {
+        self.sprite_atlas.import_dmabuf(dmabuf)
     }
 
     /// Add a node to the layout tree for the current frame. Takes the `Style` of the element for which
@@ -7142,6 +7224,55 @@ mod tests {
             "resize must wake a parked window"
         );
         assert!(!platform.simulate_display_tick());
+    }
+
+    #[test]
+    fn inactive_windows_slow_frame_callbacks_but_not_display_frames() {
+        fn chain(window: &Window, display: Rc<Cell<bool>>, ticks: Rc<Cell<u32>>) {
+            let follows = display.get();
+            let next = move |window: &mut Window, _: &mut crate::App| {
+                ticks.set(ticks.get() + 1);
+                chain(window, display, ticks);
+            };
+            if follows {
+                window.on_next_display_frame(next);
+            } else {
+                window.on_next_frame(next);
+            }
+        }
+        let mut cx = TestAppContext::single();
+        for display in [false, true] {
+            let handle = cx.add_window(|_, _| RootView {
+                explicit_size: false,
+                child_bounds: Rc::new(Cell::new(Bounds::default())),
+            });
+            let ticks = Rc::new(Cell::new(0));
+            let follows = Rc::new(Cell::new(display));
+            let platform = cx
+                .update_window(handle.into(), |_, window, _| {
+                    window.active.set(false);
+                    chain(window, follows.clone(), ticks.clone());
+                    window.platform_window.as_test().unwrap().clone()
+                })
+                .unwrap();
+            // Back to back, like a fast display's vblanks.
+            for _ in 0..8 {
+                platform.simulate_display_tick();
+            }
+            if display {
+                assert_eq!(ticks.get(), 8, "display frames keep the display's rate");
+                // The next callback asks for an ordinary frame.
+                follows.set(false);
+                platform.simulate_display_tick();
+                ticks.set(0);
+                for _ in 0..8 {
+                    platform.simulate_display_tick();
+                }
+                assert!(ticks.get() < 8, "it slows down again once display frames stop");
+            } else {
+                assert!(ticks.get() < 8, "an inactive window slows its animations");
+            }
+        }
     }
 
     struct NativeFrameProbe {
