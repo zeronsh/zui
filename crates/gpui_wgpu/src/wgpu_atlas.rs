@@ -141,12 +141,14 @@ impl WgpuAtlas {
         let _ = device.poll(wgpu::PollType::Poll);
     }
 
-    pub fn get_texture_info(&self, id: AtlasTextureId) -> WgpuTextureInfo {
+    /// `None` once the texture is freed: a scene drawn before its last tile
+    /// was removed (or the atlas cleared) can still name it.
+    pub fn get_texture_info(&self, id: AtlasTextureId) -> Option<WgpuTextureInfo> {
         let lock = self.0.lock();
-        let texture = &lock.storage[id];
-        WgpuTextureInfo {
+        let texture = lock.storage.get(id)?;
+        Some(WgpuTextureInfo {
             view: texture.view.clone(),
-        }
+        })
     }
 
     /// Clears all cached textures and tiles, forcing them to be recreated.
@@ -806,6 +808,32 @@ mod tests {
             .expect("tile should be created");
         atlas.remove(&key);
         atlas.before_frame();
+        Ok(())
+    }
+
+    #[test]
+    fn texture_info_of_a_freed_texture_is_none() -> anyhow::Result<()> {
+        let (device, queue) = test_device_and_queue()?;
+        let atlas = WgpuAtlas::new(device, queue, wgpu::TextureFormat::Bgra8Unorm);
+        let key = AtlasKey::Image(RenderImageParams {
+            image_id: ImageId(1),
+            frame_index: 0,
+        });
+        let size = Size {
+            width: DevicePixels(1),
+            height: DevicePixels(1),
+        };
+        let mut build = || Ok(Some((size, Cow::Owned(vec![0, 0, 0, 255]))));
+        let tile = atlas
+            .get_or_insert_with(&key, &mut build)?
+            .expect("tile should be created");
+        assert!(atlas.get_texture_info(tile.texture_id).is_some());
+
+        // A scene still holding the tile must not take the window down.
+        atlas.remove(&key);
+        assert!(atlas.get_texture_info(tile.texture_id).is_none());
+        atlas.clear();
+        assert!(atlas.get_texture_info(tile.texture_id).is_none());
         Ok(())
     }
 

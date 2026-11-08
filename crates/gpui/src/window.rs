@@ -1068,6 +1068,9 @@ pub struct Window {
     pub(crate) platform_window: Box<dyn PlatformWindow>,
     display_id: Option<DisplayId>,
     sprite_atlas: Arc<dyn PlatformAtlas>,
+    /// Tiles of dropped images, removed once the next frame is drawn: until
+    /// then the frame on screen can be presented again and samples them.
+    dropped_atlas_keys: Vec<crate::AtlasKey>,
     text_system: Arc<WindowTextSystem>,
     text_rendering_mode: Rc<Cell<TextRenderingMode>>,
     rem_size: Pixels,
@@ -1802,6 +1805,7 @@ impl Window {
             platform_window,
             display_id,
             sprite_atlas,
+            dropped_atlas_keys: Vec::new(),
             text_system,
             text_rendering_mode: cx.text_rendering_mode.clone(),
             rem_size: px(16.),
@@ -2792,6 +2796,12 @@ impl Window {
         // Set up the per-App arena for element allocation during this draw.
         // This ensures that multiple test Apps have isolated arenas.
         let _arena_scope = ElementArenaScope::enter(&cx.element_arena);
+
+        // The frame this draw replaces no longer gets presented: free what was
+        // dropped while it was on screen. This frame paints anew what it uses.
+        for key in self.dropped_atlas_keys.drain(..) {
+            self.sprite_atlas.remove(&key);
+        }
 
         self.invalidate_entities();
         cx.entities.clear_accessed();
@@ -4841,16 +4851,19 @@ impl Window {
         });
     }
 
-    /// Removes an image from the sprite atlas.
+    /// Removes an image from the sprite atlas when the next frame is drawn.
+    ///
+    /// The frame on screen may be presented again before then (a present
+    /// without a redraw) and still samples the image's tiles: freeing them now
+    /// would leave it drawing from a texture that no longer exists.
     pub fn drop_image(&mut self, data: Arc<RenderImage>) -> Result<()> {
-        for frame_index in 0..data.frame_count() {
-            let params = RenderImageParams {
-                image_id: data.id,
-                frame_index,
-            };
-
-            self.sprite_atlas.remove(&params.clone().into());
-        }
+        self.dropped_atlas_keys
+            .extend((0..data.frame_count()).map(|frame_index| {
+                crate::AtlasKey::from(RenderImageParams {
+                    image_id: data.id,
+                    frame_index,
+                })
+            }));
 
         Ok(())
     }
@@ -7393,5 +7406,41 @@ mod tests {
             })
             .unwrap();
         assert_eq!(b_focus_count.get(), 1);
+    }
+
+    #[test]
+    fn dropped_image_stays_in_the_atlas_until_the_next_draw() {
+        use crate::{AtlasKey, DevicePixels, RenderImage, RenderImageParams};
+        use std::sync::Arc;
+
+        let mut cx = TestAppContext::single();
+        let window = cx.add_window(|_, _| RootView {
+            explicit_size: false,
+            child_bounds: Rc::new(Cell::new(Bounds::default())),
+        });
+        cx.update_window(window.into(), |_, window, cx| {
+            let image = Arc::new(RenderImage::blank(size(DevicePixels(4), DevicePixels(4))));
+            let key: AtlasKey = RenderImageParams {
+                image_id: image.id,
+                frame_index: 0,
+            }
+            .into();
+            let in_atlas = |window: &Window| {
+                window
+                    .sprite_atlas
+                    .get_or_insert_with(&key, &mut || Ok(None))
+                    .unwrap()
+                    .is_some()
+            };
+            window.draw(cx).clear();
+            assert!(window.insert_blank_image(&image, 0).unwrap());
+            window.drop_image(image.clone()).unwrap();
+            // The frame on screen may still be presented again without a
+            // redraw, and it samples this tile.
+            assert!(in_atlas(window), "dropped before the next draw");
+            window.draw(cx).clear();
+            assert!(!in_atlas(window), "kept after the next draw");
+        })
+        .unwrap();
     }
 }
