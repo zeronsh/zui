@@ -68,6 +68,18 @@ impl RenderImage {
         }
     }
 
+    /// A transparent image whose pixels arrive through
+    /// [`crate::Window::update_image`], e.g. frames another process renders.
+    /// [`crate::Window::insert_blank_image`] allocates its atlas tile without
+    /// uploading the blank pixels where the renderer supports it.
+    pub fn blank(size: Size<DevicePixels>) -> Self {
+        let width = size.width.0.max(1) as u32;
+        let height = size.height.0.max(1) as u32;
+        // Zeroed allocations stay untouched (and unresident) unless a renderer
+        // without blank tiles has to upload them.
+        Self::new([Frame::new(image::RgbaImage::new(width, height))])
+    }
+
     /// Convert this image into a byte slice.
     pub fn as_bytes(&self, frame_index: usize) -> Option<&[u8]> {
         self.data

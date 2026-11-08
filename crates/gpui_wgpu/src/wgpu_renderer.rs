@@ -8,7 +8,7 @@ use gpui::{
 use log::warn;
 #[cfg(not(target_family = "wasm"))]
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::num::NonZeroU64;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
@@ -234,6 +234,9 @@ pub struct WgpuRenderer {
     device_lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
     surface_configured: bool,
     needs_redraw: bool,
+    /// Set when a sprite batch named an atlas texture already freed: the
+    /// scene is stale, so the batch is skipped and the window redrawn.
+    missing_atlas_texture: Cell<bool>,
     /// Frames since the last scene containing a backdrop blur; scratch is
     /// released once this reaches `SCRATCH_RELEASE_AFTER_FRAMES`.
     blur_free_frames: u32,
@@ -611,6 +614,7 @@ impl WgpuRenderer {
             device_lost: context.device_lost_flag(),
             surface_configured: true,
             needs_redraw: false,
+            missing_atlas_texture: Cell::new(false),
             blur_free_frames: 0,
             surface_supports_copy_src,
             backdrop_slot_stride,
@@ -2014,6 +2018,12 @@ impl WgpuRenderer {
                 .queue
                 .submit(std::iter::once(encoder.finish()));
             frame.present();
+            if self.missing_atlas_texture.take() {
+                // Draw a fresh scene, without cached views replaying the
+                // stale tiles.
+                log::warn!("scene named a freed atlas texture; redrawing");
+                self.needs_redraw = true;
+            }
             return true;
         }
     }
@@ -2181,7 +2191,10 @@ impl WgpuRenderer {
         instance_offset: &mut u64,
         pass: &mut wgpu::RenderPass<'_>,
     ) -> bool {
-        let tex_info = self.atlas.get_texture_info(texture_id);
+        let Some(tex_info) = self.atlas.get_texture_info(texture_id) else {
+            self.missing_atlas_texture.set(true);
+            return true;
+        };
         let data = unsafe { Self::instance_bytes(sprites) };
         self.draw_instances_with_texture(
             data,
@@ -2200,7 +2213,10 @@ impl WgpuRenderer {
         instance_offset: &mut u64,
         pass: &mut wgpu::RenderPass<'_>,
     ) -> bool {
-        let tex_info = self.atlas.get_texture_info(texture_id);
+        let Some(tex_info) = self.atlas.get_texture_info(texture_id) else {
+            self.missing_atlas_texture.set(true);
+            return true;
+        };
         let data = unsafe { Self::instance_bytes(sprites) };
         let resources = self.resources();
         let pipeline = resources
@@ -2225,7 +2241,10 @@ impl WgpuRenderer {
         instance_offset: &mut u64,
         pass: &mut wgpu::RenderPass<'_>,
     ) -> bool {
-        let tex_info = self.atlas.get_texture_info(texture_id);
+        let Some(tex_info) = self.atlas.get_texture_info(texture_id) else {
+            self.missing_atlas_texture.set(true);
+            return true;
+        };
         let data = unsafe { Self::instance_bytes(sprites) };
         self.draw_instances_with_texture(
             data,

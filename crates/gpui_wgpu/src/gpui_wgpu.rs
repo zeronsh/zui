@@ -1,5 +1,7 @@
 mod blur_kernel;
 mod cosmic_text_system;
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+mod dmabuf;
 mod wgpu_atlas;
 mod wgpu_context;
 mod wgpu_renderer;
